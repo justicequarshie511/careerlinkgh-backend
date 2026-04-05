@@ -18,12 +18,15 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
-// Database connection
+// Database connection - FIXED for Aiven MySQL (cloud database)
 const db = mysql.createConnection({
   host: process.env.DB_HOST || 'localhost',
   user: process.env.DB_USER || 'root',
   password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'careerlinkgh_db'
+  database: process.env.DB_NAME || 'careerlinkgh_db',
+  port: process.env.DB_PORT || 3306,
+  // Add SSL for Aiven cloud database
+  ssl: process.env.DB_HOST ? { rejectUnauthorized: false } : null
 });
 
 db.connect(err => {
