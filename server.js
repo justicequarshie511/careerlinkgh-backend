@@ -43,18 +43,6 @@ db.connect(err => {
   }
 });
 
-// ==================== NOTIFICATION HELPER ====================
-function createNotification(userId, type, title, message) {
-  const notificationId = uuidv4();
-  db.query(
-    'INSERT INTO notifications (id, user_id, type, title, message) VALUES (?, ?, ?, ?, ?)',
-    [notificationId, userId, type, title, message],
-    (err, result) => {
-      if (err) console.error('Failed to create notification:', err);
-    }
-  );
-}
-
 // ==================== AUTH MIDDLEWARE ====================
 const authMiddleware = (req, res, next) => {
   try {
@@ -514,7 +502,7 @@ app.delete('/api/jobs/:id', authMiddleware, (req, res) => {
 
 // ==================== APPLICATIONS ====================
 
-// Apply for a job (WITH NOTIFICATIONS)
+// Apply for a job
 app.post('/api/jobs/:jobId/apply', authMiddleware, (req, res) => {
   if (req.user.user_type !== 'job_seeker') {
     return res.status(403).json({ success: false, message: 'Only job seekers can apply' });
@@ -529,74 +517,39 @@ app.post('/api/jobs/:jobId/apply', authMiddleware, (req, res) => {
     const { cover_letter, resume_url } = req.body;
     const applicationId = uuidv4();
 
-    // First, get the employer_id for the job
-    db.query('SELECT employer_id, title FROM jobs WHERE id = ?', [req.params.jobId], (err, jobResult) => {
-      if (err || jobResult.length === 0) {
-        return res.status(404).json({ success: false, message: 'Job not found' });
-      }
-
-      const employer_id = jobResult[0].employer_id;
-      const jobTitle = jobResult[0].title;
-      
-      // Get the user_id for the employer
-      db.query('SELECT user_id FROM employers WHERE id = ?', [employer_id], (err, employerUserResult) => {
-        if (err || employerUserResult.length === 0) {
-          return res.status(404).json({ success: false, message: 'Employer not found' });
+    db.query(
+      'SELECT id FROM applications WHERE job_id = ? AND job_seeker_id = ?',
+      [req.params.jobId, job_seeker_id],
+      (err, results) => {
+        if (err) {
+          console.error('Database error:', err);
+          return res.status(500).json({ success: false, message: 'Database error' });
         }
 
-        const employerUserId = employerUserResult[0].user_id;
+        if (results.length > 0) {
+          return res.status(400).json({ success: false, message: 'Already applied for this job' });
+        }
 
         db.query(
-          'SELECT id FROM applications WHERE job_id = ? AND job_seeker_id = ?',
-          [req.params.jobId, job_seeker_id],
-          (err, results) => {
+          'INSERT INTO applications (id, job_id, job_seeker_id, cover_letter, resume_url) VALUES (?, ?, ?, ?, ?)',
+          [applicationId, req.params.jobId, job_seeker_id, cover_letter, resume_url],
+          (err, result) => {
             if (err) {
-              console.error('Database error:', err);
-              return res.status(500).json({ success: false, message: 'Database error' });
+              console.error('Application error:', err);
+              return res.status(500).json({ success: false, message: 'Failed to submit application' });
             }
 
-            if (results.length > 0) {
-              return res.status(400).json({ success: false, message: 'Already applied for this job' });
-            }
+            db.query('UPDATE jobs SET applications_count = applications_count + 1 WHERE id = ?', [req.params.jobId]);
 
-            db.query(
-              'INSERT INTO applications (id, job_id, job_seeker_id, cover_letter, resume_url) VALUES (?, ?, ?, ?, ?)',
-              [applicationId, req.params.jobId, job_seeker_id, cover_letter, resume_url],
-              (err, result) => {
-                if (err) {
-                  console.error('Application error:', err);
-                  return res.status(500).json({ success: false, message: 'Failed to submit application' });
-                }
-
-                db.query('UPDATE jobs SET applications_count = applications_count + 1 WHERE id = ?', [req.params.jobId]);
-
-                // Send notification to employer
-                createNotification(
-                  employerUserId,
-                  'application',
-                  'New Job Application',
-                  `A new candidate has applied for "${jobTitle}".`
-                );
-
-                // Send notification to job seeker
-                createNotification(
-                  req.user.id,
-                  'application',
-                  'Application Submitted',
-                  `Your application for "${jobTitle}" has been successfully submitted.`
-                );
-
-                res.status(201).json({
-                  success: true,
-                  message: 'Application submitted successfully',
-                  data: { application_id: applicationId }
-                });
-              }
-            );
+            res.status(201).json({
+              success: true,
+              message: 'Application submitted successfully',
+              data: { application_id: applicationId }
+            });
           }
         );
-      });
-    });
+      }
+    );
   });
 });
 
@@ -667,7 +620,7 @@ app.get('/api/jobs/:jobId/applications', authMiddleware, (req, res) => {
   });
 });
 
-// Update application status (employer only) - WITH NOTIFICATIONS
+// Update application status (employer only)
 app.put('/api/applications/:id/status', authMiddleware, (req, res) => {
   if (req.user.user_type !== 'employer') {
     return res.status(403).json({ success: false, message: 'Access denied' });
@@ -676,8 +629,7 @@ app.put('/api/applications/:id/status', authMiddleware, (req, res) => {
   const { status, interview_date, interview_notes } = req.body;
 
   db.query(
-    `SELECT a.id, a.job_seeker_id, j.title as job_title
-     FROM applications a
+    `SELECT a.id FROM applications a
      LEFT JOIN jobs j ON a.job_id = j.id
      LEFT JOIN employers e ON j.employer_id = e.id
      WHERE a.id = ? AND e.user_id = ?`,
@@ -686,9 +638,6 @@ app.put('/api/applications/:id/status', authMiddleware, (req, res) => {
       if (err || results.length === 0) {
         return res.status(403).json({ success: false, message: 'Unauthorized' });
       }
-
-      const jobSeekerId = results[0].job_seeker_id;
-      const jobTitle = results[0].job_title;
 
       db.query(
         `UPDATE applications 
@@ -700,47 +649,6 @@ app.put('/api/applications/:id/status', authMiddleware, (req, res) => {
             console.error('Update error:', err);
             return res.status(500).json({ success: false, message: 'Failed to update status' });
           }
-
-          // Get the user_id of the job seeker
-          db.query(
-            'SELECT user_id FROM job_seekers WHERE id = ?',
-            [jobSeekerId],
-            (err, userResults) => {
-              if (!err && userResults.length > 0) {
-                let notificationMessage = '';
-                let notificationTitle = '';
-                switch(status) {
-                  case 'shortlisted':
-                    notificationTitle = 'Application Shortlisted';
-                    notificationMessage = `Congratulations! You have been shortlisted for "${jobTitle}". The employer will contact you soon.`;
-                    break;
-                  case 'interview':
-                    notificationTitle = 'Interview Invitation';
-                    notificationMessage = `Good news! You have been invited for an interview for "${jobTitle}". Check your email for details.`;
-                    break;
-                  case 'accepted':
-                    notificationTitle = 'Application Accepted';
-                    notificationMessage = `Congratulations! You have been selected for "${jobTitle}". The employer will reach out with next steps.`;
-                    break;
-                  case 'rejected':
-                    notificationTitle = 'Application Update';
-                    notificationMessage = `Thank you for your interest. Your application for "${jobTitle}" was not selected at this time.`;
-                    break;
-                  default:
-                    notificationTitle = 'Application Status Update';
-                    notificationMessage = `Your application status for "${jobTitle}" has been updated to: ${status}`;
-                }
-                
-                createNotification(
-                  userResults[0].user_id,
-                  'application',
-                  notificationTitle,
-                  notificationMessage
-                );
-              }
-            }
-          );
-
           res.json({ success: true, message: 'Application status updated' });
         }
       );
@@ -838,7 +746,7 @@ app.get('/api/notifications', authMiddleware, (req, res) => {
   
   db.query(
     `SELECT * FROM notifications 
-     WHERE user_id = ?
+     WHERE user_id = (SELECT id FROM users WHERE id = ?)
      ORDER BY created_at DESC 
      LIMIT ? OFFSET ?`,
     [req.user.id, limit, offset],
@@ -863,40 +771,6 @@ app.get('/api/notifications', authMiddleware, (req, res) => {
           });
         }
       );
-    }
-  );
-});
-
-// Mark single notification as read
-app.put('/api/notifications/:id/read', authMiddleware, (req, res) => {
-  db.query(
-    'UPDATE notifications SET is_read = true, read_at = NOW() WHERE id = ? AND user_id = ?',
-    [req.params.id, req.user.id],
-    (err, result) => {
-      if (err) {
-        console.error('Mark read error:', err);
-        return res.status(500).json({ success: false, message: 'Database error' });
-      }
-      res.json({ success: true, message: 'Notification marked as read' });
-    }
-  );
-});
-
-// Mark all notifications as read
-app.put('/api/notifications/read-all', authMiddleware, (req, res) => {
-  db.query(
-    'UPDATE notifications SET is_read = true, read_at = NOW() WHERE user_id = ? AND is_read = false',
-    [req.user.id],
-    (err, result) => {
-      if (err) {
-        console.error('Mark all read error:', err);
-        return res.status(500).json({ success: false, message: 'Database error' });
-      }
-      res.json({ 
-        success: true, 
-        message: 'All notifications marked as read',
-        count: result.affectedRows 
-      });
     }
   );
 });
@@ -951,8 +825,36 @@ app.post('/api/upload/profile-picture', authMiddleware, upload.single('image'), 
     res.json({ success: true, message: 'Profile picture uploaded successfully', data: { url: fileUrl } });
   });
 });
+// Update seeker profile
+app.put('/api/seeker/profile', authMiddleware, (req, res) => {
+  if (req.user.user_type !== 'job_seeker') {
+    return res.status(403).json({ success: false, message: 'Access denied' });
+  }
 
-// Upload resume (for job seekers)
+  const { headline, location, skills, experience_years, current_salary, expected_salary } = req.body;
+
+  db.query(
+    `UPDATE job_seekers SET 
+      headline = COALESCE(?, headline),
+      location = COALESCE(?, location),
+      skills = COALESCE(?, skills),
+      experience_years = COALESCE(?, experience_years),
+      current_salary = COALESCE(?, current_salary),
+      expected_salary = COALESCE(?, expected_salary),
+      updated_at = NOW()
+     WHERE user_id = ?`,
+    [headline, location, skills, experience_years, current_salary, expected_salary, req.user.id],
+    (err, result) => {
+      if (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Database error' });
+      }
+      res.json({ success: true, message: 'Profile updated successfully' });
+    }
+  );
+});
+
+// Upload resume (for job seekers) - FIXED
 app.post('/api/upload/resume', authMiddleware, upload.single('resume'), (req, res) => {
   if (req.user.user_type !== 'job_seeker') {
     return res.status(403).json({ success: false, message: 'Only job seekers can upload resumes' });
@@ -995,6 +897,28 @@ app.post('/api/upload/company-logo', authMiddleware, upload.single('logo'), (req
       return res.status(500).json({ success: false, message: 'Database error' });
     }
     res.json({ success: true, message: 'Company logo uploaded successfully', data: { url: fileUrl } });
+  });
+});
+
+// Mark notification as read
+app.put('/api/notifications/:id/read', authMiddleware, (req, res) => {
+  db.query('UPDATE notifications SET is_read = true, read_at = NOW() WHERE id = ? AND user_id = ?', [req.params.id, req.user.id], (err, result) => {
+    if (err) {
+      console.error('Mark read error:', err);
+      return res.status(500).json({ success: false, message: 'Database error' });
+    }
+    res.json({ success: true, message: 'Notification marked as read' });
+  });
+});
+
+// Mark all notifications as read
+app.put('/api/notifications/read-all', authMiddleware, (req, res) => {
+  db.query('UPDATE notifications SET is_read = true, read_at = NOW() WHERE user_id = ? AND is_read = false', [req.user.id], (err, result) => {
+    if (err) {
+      console.error('Mark all read error:', err);
+      return res.status(500).json({ success: false, message: 'Database error' });
+    }
+    res.json({ success: true, message: 'All notifications marked as read', count: result.affectedRows });
   });
 });
 
@@ -1091,11 +1015,12 @@ app.get('/api/notifications/unread-count', authMiddleware, (req, res) => {
 });
 
 // ==================== JOB ALERTS ====================
+// (Simplified - can be expanded later)
 app.post('/api/job-alerts', authMiddleware, (req, res) => {
   if (req.user.user_type !== 'job_seeker') {
     return res.status(403).json({ success: false, message: 'Only job seekers can create alerts' });
   }
-  res.json({ success: true, message: 'Job alert created' });
+  res.json({ success: true, message: 'Job alert created (feature coming soon)' });
 });
 
 app.get('/api/job-alerts', authMiddleware, (req, res) => {
@@ -1103,18 +1028,19 @@ app.get('/api/job-alerts', authMiddleware, (req, res) => {
 });
 
 // ==================== COMPANY REVIEWS ====================
+// (Simplified - can be expanded later)
 app.post('/api/companies/:companyId/reviews', authMiddleware, (req, res) => {
   if (req.user.user_type !== 'job_seeker') {
     return res.status(403).json({ success: false, message: 'Only job seekers can review companies' });
   }
-  res.json({ success: true, message: 'Review added' });
+  res.json({ success: true, message: 'Review added (feature coming soon)' });
 });
 
 app.get('/api/companies/:companyId/reviews', (req, res) => {
   res.json({ success: true, data: [] });
 });
 
-// ==================== SEEKER PROFILE ENDPOINT ====================
+// ==================== SEEKER PROFILE ENDPOINT (ADDED) ====================
 app.get('/api/seeker/profile', authMiddleware, (req, res) => {
   if (req.user.user_type !== 'job_seeker') {
     return res.status(403).json({ success: false, message: 'Access denied' });
@@ -1131,7 +1057,7 @@ app.get('/api/seeker/profile', authMiddleware, (req, res) => {
         console.error('Database error:', err);
         return res.status(500).json({ success: false, message: 'Database error' });
       }
-      res.json({ success: true, data: results[0] || {} });
+      res.json({ success: true, data: results[0] });
     }
   );
 });
