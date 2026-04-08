@@ -14,6 +14,12 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 4000;
 
+// Ensure uploads directory exists
+const uploadDir = 'uploads/';
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
+
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -820,7 +826,7 @@ app.post('/api/upload/profile-picture', authMiddleware, upload.single('image'), 
   });
 });
 
-// Upload resume (for job seekers)
+// Upload resume (for job seekers) - FIXED
 app.post('/api/upload/resume', authMiddleware, upload.single('resume'), (req, res) => {
   if (req.user.user_type !== 'job_seeker') {
     return res.status(403).json({ success: false, message: 'Only job seekers can upload resumes' });
@@ -832,13 +838,17 @@ app.post('/api/upload/resume', authMiddleware, upload.single('resume'), (req, re
 
   const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
   
-  db.query('UPDATE job_seekers SET resume_url = ?, resume_file_name = ? WHERE user_id = ?', [fileUrl, req.file.originalname, req.user.id], (err, result) => {
-    if (err) {
-      console.error('Database error:', err);
-      return res.status(500).json({ success: false, message: 'Database error' });
+  db.query(
+    'UPDATE job_seekers SET resume_url = ?, resume_file_name = ? WHERE user_id = ?',
+    [fileUrl, req.file.originalname, req.user.id],
+    (err, result) => {
+      if (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Database error' });
+      }
+      res.json({ success: true, message: 'Resume uploaded successfully', data: { url: fileUrl, filename: req.file.originalname } });
     }
-    res.json({ success: true, message: 'Resume uploaded successfully', data: { url: fileUrl, filename: req.file.originalname } });
-  });
+  );
 });
 
 // Upload company logo (for employers)
@@ -1000,6 +1010,28 @@ app.post('/api/companies/:companyId/reviews', authMiddleware, (req, res) => {
 
 app.get('/api/companies/:companyId/reviews', (req, res) => {
   res.json({ success: true, data: [] });
+});
+
+// ==================== SEEKER PROFILE ENDPOINT (ADDED) ====================
+app.get('/api/seeker/profile', authMiddleware, (req, res) => {
+  if (req.user.user_type !== 'job_seeker') {
+    return res.status(403).json({ success: false, message: 'Access denied' });
+  }
+
+  db.query(
+    `SELECT u.*, js.headline, js.location, js.skills, js.resume_url, js.experience_years
+     FROM users u
+     LEFT JOIN job_seekers js ON u.id = js.user_id
+     WHERE u.id = ?`,
+    [req.user.id],
+    (err, results) => {
+      if (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Database error' });
+      }
+      res.json({ success: true, data: results[0] });
+    }
+  );
 });
 
 // ==================== STATISTICS ====================
