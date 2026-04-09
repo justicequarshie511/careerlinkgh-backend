@@ -825,36 +825,146 @@ app.post('/api/upload/profile-picture', authMiddleware, upload.single('image'), 
     res.json({ success: true, message: 'Profile picture uploaded successfully', data: { url: fileUrl } });
   });
 });
-// Update seeker profile
+
+// ==================== UPDATED SEEKER PROFILE ENDPOINTS (FOR RESUME BUILDER) ====================
+
+// UPDATE: Enhanced PUT endpoint for seeker profile (supports all resume fields)
 app.put('/api/seeker/profile', authMiddleware, (req, res) => {
   if (req.user.user_type !== 'job_seeker') {
     return res.status(403).json({ success: false, message: 'Access denied' });
   }
 
-  const { headline, location, skills, experience_years, current_salary, expected_salary } = req.body;
+  const { 
+    headline, location, skills, experience_years, 
+    current_salary, expected_salary, summary, 
+    bio, experiences, educations 
+  } = req.body;
+
+  // Build dynamic update query
+  const updates = [];
+  const values = [];
+
+  if (headline !== undefined) {
+    updates.push('headline = ?');
+    values.push(headline);
+  }
+  if (location !== undefined) {
+    updates.push('location = ?');
+    values.push(location);
+  }
+  if (skills !== undefined) {
+    const skillsJson = typeof skills === 'string' ? skills : JSON.stringify(skills);
+    updates.push('skills = ?');
+    values.push(skillsJson);
+  }
+  if (experience_years !== undefined) {
+    updates.push('experience_years = ?');
+    values.push(experience_years);
+  }
+  if (current_salary !== undefined) {
+    updates.push('current_salary = ?');
+    values.push(current_salary);
+  }
+  if (expected_salary !== undefined) {
+    updates.push('expected_salary = ?');
+    values.push(expected_salary);
+  }
+  if (summary !== undefined) {
+    updates.push('summary = ?');
+    values.push(summary);
+  }
+  if (bio !== undefined) {
+    updates.push('bio = ?');
+    values.push(bio);
+  }
+  if (experiences !== undefined) {
+    const experiencesJson = typeof experiences === 'string' ? experiences : JSON.stringify(experiences);
+    updates.push('experiences = ?');
+    values.push(experiencesJson);
+  }
+  if (educations !== undefined) {
+    const educationsJson = typeof educations === 'string' ? educations : JSON.stringify(educations);
+    updates.push('educations = ?');
+    values.push(educationsJson);
+  }
+
+  if (updates.length === 0) {
+    return res.status(400).json({ success: false, message: 'No fields to update' });
+  }
+
+  updates.push('updated_at = NOW()');
+  values.push(req.user.id);
+
+  const query = `UPDATE job_seekers SET ${updates.join(', ')} WHERE user_id = ?`;
+  
+  db.query(query, values, (err, result) => {
+    if (err) {
+      console.error('Database error:', err);
+      return res.status(500).json({ success: false, message: 'Database error: ' + err.message });
+    }
+    
+    res.json({ success: true, message: 'Profile updated successfully' });
+  });
+});
+
+// UPDATE: Enhanced GET endpoint for seeker profile (returns all resume data)
+app.get('/api/seeker/profile', authMiddleware, (req, res) => {
+  if (req.user.user_type !== 'job_seeker') {
+    return res.status(403).json({ success: false, message: 'Access denied' });
+  }
 
   db.query(
-    `UPDATE job_seekers SET 
-      headline = COALESCE(?, headline),
-      location = COALESCE(?, location),
-      skills = COALESCE(?, skills),
-      experience_years = COALESCE(?, experience_years),
-      current_salary = COALESCE(?, current_salary),
-      expected_salary = COALESCE(?, expected_salary),
-      updated_at = NOW()
-     WHERE user_id = ?`,
-    [headline, location, skills, experience_years, current_salary, expected_salary, req.user.id],
-    (err, result) => {
+    `SELECT u.id, u.email, u.first_name, u.last_name, u.phone, u.avatar_url,
+            js.headline, js.location, js.skills, js.resume_url, js.experience_years,
+            js.current_salary, js.expected_salary, js.bio, js.summary,
+            js.experiences, js.educations, js.is_open_to_work
+     FROM users u
+     LEFT JOIN job_seekers js ON u.id = js.user_id
+     WHERE u.id = ?`,
+    [req.user.id],
+    (err, results) => {
       if (err) {
         console.error('Database error:', err);
         return res.status(500).json({ success: false, message: 'Database error' });
       }
-      res.json({ success: true, message: 'Profile updated successfully' });
+      
+      if (results.length === 0) {
+        return res.status(404).json({ success: false, message: 'Profile not found' });
+      }
+      
+      const profile = results[0];
+      
+      // Parse JSON fields if they exist and are strings
+      if (profile.skills && typeof profile.skills === 'string') {
+        try {
+          profile.skills = JSON.parse(profile.skills);
+        } catch(e) {
+          profile.skills = [];
+        }
+      }
+      
+      if (profile.experiences && typeof profile.experiences === 'string') {
+        try {
+          profile.experiences = JSON.parse(profile.experiences);
+        } catch(e) {
+          profile.experiences = [];
+        }
+      }
+      
+      if (profile.educations && typeof profile.educations === 'string') {
+        try {
+          profile.educations = JSON.parse(profile.educations);
+        } catch(e) {
+          profile.educations = [];
+        }
+      }
+      
+      res.json({ success: true, data: profile });
     }
   );
 });
 
-// Upload resume (for job seekers) - FIXED
+// Upload resume (for job seekers)
 app.post('/api/upload/resume', authMiddleware, upload.single('resume'), (req, res) => {
   if (req.user.user_type !== 'job_seeker') {
     return res.status(403).json({ success: false, message: 'Only job seekers can upload resumes' });
@@ -867,8 +977,8 @@ app.post('/api/upload/resume', authMiddleware, upload.single('resume'), (req, re
   const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
   
   db.query(
-    'UPDATE job_seekers SET resume_url = ?, resume_file_name = ? WHERE user_id = ?',
-    [fileUrl, req.file.originalname, req.user.id],
+    'UPDATE job_seekers SET resume_url = ? WHERE user_id = ?',
+    [fileUrl, req.user.id],
     (err, result) => {
       if (err) {
         console.error('Database error:', err);
@@ -960,36 +1070,75 @@ app.delete('/api/auth/avatar', authMiddleware, (req, res) => {
   });
 });
 
-// Update profile (personal info)
+// UPDATE: Enhanced profile update endpoint (handles both users and job_seekers)
 app.put('/api/auth/profile', authMiddleware, (req, res) => {
   const { first_name, last_name, phone, location, headline } = req.body;
   
-  db.query(
-    `UPDATE users SET 
-      first_name = COALESCE(?, first_name),
-      last_name = COALESCE(?, last_name),
-      phone = COALESCE(?, phone)
-     WHERE id = ?`,
-    [first_name, last_name, phone, req.user.id],
-    (err, result) => {
-      if (err) {
-        console.error('Database error:', err);
-        return res.status(500).json({ success: false, message: 'Database error' });
+  // Update users table
+  const userUpdates = [];
+  const userValues = [];
+  
+  if (first_name !== undefined) {
+    userUpdates.push('first_name = ?');
+    userValues.push(first_name);
+  }
+  if (last_name !== undefined) {
+    userUpdates.push('last_name = ?');
+    userValues.push(last_name);
+  }
+  if (phone !== undefined) {
+    userUpdates.push('phone = ?');
+    userValues.push(phone);
+  }
+  
+  if (userUpdates.length > 0) {
+    userUpdates.push('updated_at = NOW()');
+    userValues.push(req.user.id);
+    
+    db.query(
+      `UPDATE users SET ${userUpdates.join(', ')} WHERE id = ?`,
+      userValues,
+      (err, result) => {
+        if (err) {
+          console.error('Database error:', err);
+          return res.status(500).json({ success: false, message: 'Database error' });
+        }
       }
-      
-      if (location || headline) {
-        db.query(
-          `UPDATE job_seekers SET 
-            location = COALESCE(?, location),
-            headline = COALESCE(?, headline)
-           WHERE user_id = ?`,
-          [location, headline, req.user.id]
-        );
-      }
-      
-      res.json({ success: true, message: 'Profile updated successfully' });
+    );
+  }
+  
+  // Update job_seekers table if location or headline provided
+  if (location !== undefined || headline !== undefined) {
+    const seekerUpdates = [];
+    const seekerValues = [];
+    
+    if (location !== undefined) {
+      seekerUpdates.push('location = ?');
+      seekerValues.push(location);
     }
-  );
+    if (headline !== undefined) {
+      seekerUpdates.push('headline = ?');
+      seekerValues.push(headline);
+    }
+    
+    if (seekerUpdates.length > 0) {
+      seekerUpdates.push('updated_at = NOW()');
+      seekerValues.push(req.user.id);
+      
+      db.query(
+        `UPDATE job_seekers SET ${seekerUpdates.join(', ')} WHERE user_id = ?`,
+        seekerValues,
+        (err, result) => {
+          if (err) {
+            console.error('Database error:', err);
+            return res.status(500).json({ success: false, message: 'Database error' });
+          }
+        }
+      );
+    }
+  }
+  
+  res.json({ success: true, message: 'Profile updated successfully' });
 });
 
 // Delete notification
@@ -1015,7 +1164,6 @@ app.get('/api/notifications/unread-count', authMiddleware, (req, res) => {
 });
 
 // ==================== JOB ALERTS ====================
-// (Simplified - can be expanded later)
 app.post('/api/job-alerts', authMiddleware, (req, res) => {
   if (req.user.user_type !== 'job_seeker') {
     return res.status(403).json({ success: false, message: 'Only job seekers can create alerts' });
@@ -1028,7 +1176,6 @@ app.get('/api/job-alerts', authMiddleware, (req, res) => {
 });
 
 // ==================== COMPANY REVIEWS ====================
-// (Simplified - can be expanded later)
 app.post('/api/companies/:companyId/reviews', authMiddleware, (req, res) => {
   if (req.user.user_type !== 'job_seeker') {
     return res.status(403).json({ success: false, message: 'Only job seekers can review companies' });
@@ -1038,28 +1185,6 @@ app.post('/api/companies/:companyId/reviews', authMiddleware, (req, res) => {
 
 app.get('/api/companies/:companyId/reviews', (req, res) => {
   res.json({ success: true, data: [] });
-});
-
-// ==================== SEEKER PROFILE ENDPOINT (ADDED) ====================
-app.get('/api/seeker/profile', authMiddleware, (req, res) => {
-  if (req.user.user_type !== 'job_seeker') {
-    return res.status(403).json({ success: false, message: 'Access denied' });
-  }
-
-  db.query(
-    `SELECT u.*, js.headline, js.location, js.skills, js.resume_url, js.experience_years
-     FROM users u
-     LEFT JOIN job_seekers js ON u.id = js.user_id
-     WHERE u.id = ?`,
-    [req.user.id],
-    (err, results) => {
-      if (err) {
-        console.error('Database error:', err);
-        return res.status(500).json({ success: false, message: 'Database error' });
-      }
-      res.json({ success: true, data: results[0] });
-    }
-  );
 });
 
 // ==================== STATISTICS ====================
