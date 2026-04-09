@@ -14,6 +14,19 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 4000;
 
+// Helper function to generate correct file URLs (HTTPS for production)
+const getFileUrl = (req, filename) => {
+  const host = req.get('host');
+  
+  // If behind a reverse proxy (like Render)
+  if (req.get('x-forwarded-proto') === 'https' || process.env.NODE_ENV === 'production') {
+    return `https://${host}/uploads/${filename}`;
+  }
+  
+  // Local development
+  return `${req.protocol}://${host}/uploads/${filename}`;
+};
+
 // Ensure uploads directory exists
 const uploadDir = 'uploads/';
 if (!fs.existsSync(uploadDir)) {
@@ -42,6 +55,22 @@ db.connect(err => {
     console.log('✅ Database connected successfully');
   }
 });
+
+// Helper function to create notification
+const createNotification = (userId, type, title, message, relatedId = null) => {
+  const notificationId = uuidv4();
+  db.query(
+    'INSERT INTO notifications (id, user_id, type, title, message, related_id, is_read, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, NOW())',
+    [notificationId, userId, type, title, message, relatedId],
+    (err) => {
+      if (err) {
+        console.error('Error creating notification:', err);
+      } else {
+        console.log(`✅ Notification created: ${type} for user ${userId}`);
+      }
+    }
+  );
+};
 
 // ==================== AUTH MIDDLEWARE ====================
 const authMiddleware = (req, res, next) => {
@@ -184,8 +213,9 @@ app.post('/api/auth/login', (req, res) => {
 app.get('/api/auth/me', authMiddleware, (req, res) => {
   db.query(
     `SELECT u.id, u.email, u.first_name, u.last_name, u.phone, u.user_type, u.email_verified, u.avatar_url,
-            e.id as employer_id, e.company_name,
-            js.id as job_seeker_id, js.headline, js.location
+            e.id as employer_id, e.company_name, e.company_logo, e.company_description, e.industry, e.city, e.verified as company_verified,
+            js.id as job_seeker_id, js.headline, js.location, js.skills, js.resume_url, js.experience_years,
+            js.current_salary, js.expected_salary, js.bio, js.summary, js.experiences, js.educations, js.is_open_to_work
      FROM users u
      LEFT JOIN employers e ON u.id = e.user_id
      LEFT JOIN job_seekers js ON u.id = js.user_id
@@ -530,24 +560,71 @@ app.post('/api/jobs/:jobId/apply', authMiddleware, (req, res) => {
           return res.status(400).json({ success: false, message: 'Already applied for this job' });
         }
 
-        db.query(
-          'INSERT INTO applications (id, job_id, job_seeker_id, cover_letter, resume_url) VALUES (?, ?, ?, ?, ?)',
-          [applicationId, req.params.jobId, job_seeker_id, cover_letter, resume_url],
-          (err, result) => {
-            if (err) {
-              console.error('Application error:', err);
-              return res.status(500).json({ success: false, message: 'Failed to submit application' });
-            }
-
-            db.query('UPDATE jobs SET applications_count = applications_count + 1 WHERE id = ?', [req.params.jobId]);
-
-            res.status(201).json({
-              success: true,
-              message: 'Application submitted successfully',
-              data: { application_id: applicationId }
-            });
+        // Get job details for notification
+        db.query('SELECT title, employer_id FROM jobs WHERE id = ?', [req.params.jobId], (err, jobResults) => {
+          if (err || jobResults.length === 0) {
+            console.error('Job not found:', err);
+            return res.status(400).json({ success: false, message: 'Job not found' });
           }
-        );
+
+          const jobTitle = jobResults[0].title;
+          const employerId = jobResults[0].employer_id;
+
+          db.query(
+            'INSERT INTO applications (id, job_id, job_seeker_id, cover_letter, resume_url) VALUES (?, ?, ?, ?, ?)',
+            [applicationId, req.params.jobId, job_seeker_id, cover_letter, resume_url],
+            (err, result) => {
+              if (err) {
+                console.error('Application error:', err);
+                return res.status(500).json({ success: false, message: 'Failed to submit application' });
+              }
+
+              db.query('UPDATE jobs SET applications_count = applications_count + 1 WHERE id = ?', [req.params.jobId]);
+
+              // Create notification for job seeker
+              createNotification(
+                req.user.id,
+                'application',
+                'Application Submitted',
+                `You have successfully applied for the job: ${jobTitle}`,
+                req.params.jobId
+              );
+
+              // Get employer user_id to send them a notification
+              db.query('SELECT user_id FROM employers WHERE id = ?', [employerId], (err, empResults) => {
+                if (empResults && empResults.length > 0) {
+                  const employerUserId = empResults[0].user_id;
+                  
+                  // Get seeker's name for notification
+                  db.query(
+                    'SELECT first_name, last_name FROM users WHERE id = ?',
+                    [req.user.id],
+                    (err, userResults) => {
+                      if (userResults && userResults.length > 0) {
+                        const seekerName = `${userResults[0].first_name} ${userResults[0].last_name}`;
+                        
+                        // Create notification for employer
+                        createNotification(
+                          employerUserId,
+                          'new_application',
+                          'New Job Application',
+                          `${seekerName} has applied for your job: ${jobTitle}`,
+                          req.params.jobId
+                        );
+                      }
+                    }
+                  );
+                }
+              });
+
+              res.status(201).json({
+                success: true,
+                message: 'Application submitted successfully',
+                data: { application_id: applicationId }
+              });
+            }
+          );
+        });
       }
     );
   });
@@ -629,7 +706,7 @@ app.put('/api/applications/:id/status', authMiddleware, (req, res) => {
   const { status, interview_date, interview_notes } = req.body;
 
   db.query(
-    `SELECT a.id FROM applications a
+    `SELECT a.id, a.job_id, a.job_seeker_id, j.title FROM applications a
      LEFT JOIN jobs j ON a.job_id = j.id
      LEFT JOIN employers e ON j.employer_id = e.id
      WHERE a.id = ? AND e.user_id = ?`,
@@ -638,6 +715,9 @@ app.put('/api/applications/:id/status', authMiddleware, (req, res) => {
       if (err || results.length === 0) {
         return res.status(403).json({ success: false, message: 'Unauthorized' });
       }
+
+      const application = results[0];
+      const jobTitle = application.title;
 
       db.query(
         `UPDATE applications 
@@ -649,6 +729,49 @@ app.put('/api/applications/:id/status', authMiddleware, (req, res) => {
             console.error('Update error:', err);
             return res.status(500).json({ success: false, message: 'Failed to update status' });
           }
+
+          // Get job seeker's user_id to send notification
+          db.query(
+            'SELECT user_id FROM job_seekers WHERE id = ?',
+            [application.job_seeker_id],
+            (err, seekerResults) => {
+              if (seekerResults && seekerResults.length > 0) {
+                const seekerUserId = seekerResults[0].user_id;
+
+                // Create status-specific notification messages
+                let notificationTitle = 'Application Status Updated';
+                let notificationMessage = `Your application for ${jobTitle} has been ${status}`;
+
+                switch(status) {
+                  case 'shortlisted':
+                    notificationTitle = '🎉 Shortlisted!';
+                    notificationMessage = `Great news! You've been shortlisted for ${jobTitle}`;
+                    break;
+                  case 'interview':
+                    notificationTitle = '📅 Interview Scheduled';
+                    notificationMessage = `You have an interview scheduled for ${jobTitle}${interview_date ? ` on ${new Date(interview_date).toLocaleDateString()}` : ''}`;
+                    break;
+                  case 'accepted':
+                    notificationTitle = '🎉 Congratulations!';
+                    notificationMessage = `Congratulations! Your application for ${jobTitle} has been accepted!`;
+                    break;
+                  case 'rejected':
+                    notificationTitle = 'Application Update';
+                    notificationMessage = `Your application for ${jobTitle} was not successful this time. Keep trying!`;
+                    break;
+                }
+
+                createNotification(
+                  seekerUserId,
+                  'application_update',
+                  notificationTitle,
+                  notificationMessage,
+                  application.job_id
+                );
+              }
+            }
+          );
+
           res.json({ success: true, message: 'Application status updated' });
         }
       );
@@ -815,7 +938,7 @@ app.post('/api/upload/profile-picture', authMiddleware, upload.single('image'), 
     return res.status(400).json({ success: false, message: 'No file uploaded' });
   }
 
-  const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+  const fileUrl = getFileUrl(req, req.file.filename);
   
   db.query('UPDATE users SET avatar_url = ? WHERE id = ?', [fileUrl, req.user.id], (err, result) => {
     if (err) {
@@ -974,7 +1097,7 @@ app.post('/api/upload/resume', authMiddleware, upload.single('resume'), (req, re
     return res.status(400).json({ success: false, message: 'No file uploaded' });
   }
 
-  const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+  const fileUrl = getFileUrl(req, req.file.filename);
   
   db.query(
     'UPDATE job_seekers SET resume_url = ? WHERE user_id = ?',
@@ -999,7 +1122,7 @@ app.post('/api/upload/company-logo', authMiddleware, upload.single('logo'), (req
     return res.status(400).json({ success: false, message: 'No file uploaded' });
   }
 
-  const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+  const fileUrl = getFileUrl(req, req.file.filename);
   
   db.query('UPDATE employers SET company_logo = ? WHERE user_id = ?', [fileUrl, req.user.id], (err, result) => {
     if (err) {
@@ -1048,7 +1171,7 @@ app.post('/api/auth/avatar', authMiddleware, upload.single('avatar'), (req, res)
     return res.status(400).json({ success: false, message: 'File size must be less than 2MB' });
   }
 
-  const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+  const fileUrl = getFileUrl(req, req.file.filename);
   
   db.query('UPDATE users SET avatar_url = ? WHERE id = ?', [fileUrl, req.user.id], (err, result) => {
     if (err) {
