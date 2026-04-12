@@ -1640,6 +1640,409 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString()
   });
 });
+// ==================== ADMIN ROUTES ====================
+
+// Admin middleware (check if user is admin)
+const adminMiddleware = (req, res, next) => {
+  if (req.user.user_type !== 'admin') {
+    return res.status(403).json({ success: false, message: 'Access denied. Admin only.' });
+  }
+  next();
+};
+
+// Get all users (admin only)
+app.get('/api/admin/users', authMiddleware, adminMiddleware, (req, res) => {
+  const limit = parseInt(req.query.limit) || 50;
+  const offset = parseInt(req.query.offset) || 0;
+  
+  db.query(
+    `SELECT id, email, first_name, last_name, phone, user_type, is_active, email_verified, created_at, last_login
+     FROM users 
+     ORDER BY created_at DESC 
+     LIMIT ? OFFSET ?`,
+    [limit, offset],
+    (err, results) => {
+      if (err) {
+        console.error('Admin users error:', err);
+        return res.status(500).json({ success: false, message: 'Database error' });
+      }
+      
+      // Get total count
+      db.query('SELECT COUNT(*) as total FROM users', (err, countResult) => {
+        res.json({ 
+          success: true, 
+          data: results,
+          total: countResult[0].total,
+          limit: limit,
+          offset: offset
+        });
+      });
+    }
+  );
+});
+
+// Get all employers (admin only)
+app.get('/api/admin/employers', authMiddleware, adminMiddleware, (req, res) => {
+  db.query(
+    `SELECT e.*, u.email, u.first_name, u.last_name, u.created_at as user_joined
+     FROM employers e
+     LEFT JOIN users u ON e.user_id = u.id
+     ORDER BY e.created_at DESC`,
+    (err, results) => {
+      if (err) {
+        console.error('Admin employers error:', err);
+        return res.status(500).json({ success: false, message: 'Database error' });
+      }
+      res.json({ success: true, data: results });
+    }
+  );
+});
+
+// Get all jobs (admin only)
+app.get('/api/admin/jobs', authMiddleware, adminMiddleware, (req, res) => {
+  const limit = parseInt(req.query.limit) || 50;
+  
+  db.query(
+    `SELECT j.*, e.company_name, u.email as employer_email, c.name as category_name
+     FROM jobs j
+     LEFT JOIN employers e ON j.employer_id = e.id
+     LEFT JOIN users u ON e.user_id = u.id
+     LEFT JOIN job_categories c ON j.category_id = c.id
+     ORDER BY j.created_at DESC
+     LIMIT ?`,
+    [limit],
+    (err, results) => {
+      if (err) {
+        console.error('Admin jobs error:', err);
+        return res.status(500).json({ success: false, message: 'Database error' });
+      }
+      res.json({ success: true, data: results });
+    }
+  );
+});
+
+// Verify a company (admin only)
+app.put('/api/admin/verify-company/:id', authMiddleware, adminMiddleware, (req, res) => {
+  const { verified } = req.body;
+  
+  db.query(
+    'UPDATE employers SET verified = ? WHERE id = ?',
+    [verified ? 1 : 0, req.params.id],
+    (err, result) => {
+      if (err) {
+        console.error('Verify company error:', err);
+        return res.status(500).json({ success: false, message: 'Database error' });
+      }
+      
+      // Get company email to notify employer
+      db.query(
+        'SELECT u.email, e.company_name FROM employers e LEFT JOIN users u ON e.user_id = u.id WHERE e.id = ?',
+        [req.params.id],
+        (err, companyResults) => {
+          if (companyResults && companyResults.length > 0) {
+            const statusText = verified ? 'verified' : 'unverified';
+            createNotification(
+              companyResults[0].user_id,
+              'system',
+              verified ? 'Company Verified ✓' : 'Company Status Updated',
+              `Your company "${companyResults[0].company_name}" has been ${statusText}.`,
+              req.params.id
+            );
+          }
+        }
+      );
+      
+      res.json({ success: true, message: `Company ${verified ? 'verified' : 'unverified'} successfully` });
+    }
+  );
+});
+
+// Delete a user (admin only)
+app.delete('/api/admin/users/:id', authMiddleware, adminMiddleware, (req, res) => {
+  db.query('DELETE FROM users WHERE id = ?', [req.params.id], (err, result) => {
+    if (err) {
+      console.error('Delete user error:', err);
+      return res.status(500).json({ success: false, message: 'Database error' });
+    }
+    res.json({ success: true, message: 'User deleted successfully' });
+  });
+});
+
+// Get platform stats (enhanced for admin)
+app.get('/api/admin/stats', authMiddleware, adminMiddleware, (req, res) => {
+  const queries = {
+    totalUsers: 'SELECT COUNT(*) as count FROM users',
+    totalEmployers: 'SELECT COUNT(*) as count FROM users WHERE user_type = "employer"',
+    totalJobSeekers: 'SELECT COUNT(*) as count FROM users WHERE user_type = "job_seeker"',
+    totalJobs: 'SELECT COUNT(*) as count FROM jobs',
+    activeJobs: 'SELECT COUNT(*) as count FROM jobs WHERE is_active = true',
+    totalApplications: 'SELECT COUNT(*) as count FROM applications',
+    pendingApplications: 'SELECT COUNT(*) as count FROM applications WHERE status = "pending"',
+    verifiedCompanies: 'SELECT COUNT(*) as count FROM employers WHERE verified = true',
+    totalNotifications: 'SELECT COUNT(*) as count FROM notifications'
+  };
+  
+  const results = {};
+  let completed = 0;
+  const totalQueries = Object.keys(queries).length;
+  
+  for (const [key, query] of Object.entries(queries)) {
+    db.query(query, (err, result) => {
+      if (err) {
+        console.error(`Stats error for ${key}:`, err);
+        results[key] = 0;
+      } else {
+        results[key] = result[0].count;
+      }
+      completed++;
+      
+      if (completed === totalQueries) {
+        res.json({ success: true, data: results });
+      }
+    });
+  }
+});
+// Activate user (admin only)
+app.put('/api/admin/users/:id/activate', authMiddleware, adminMiddleware, (req, res) => {
+  db.query('UPDATE users SET is_active = 1 WHERE id = ?', [req.params.id], (err, result) => {
+    if (err) {
+      console.error('Activate user error:', err);
+      return res.status(500).json({ success: false, message: 'Database error' });
+    }
+    
+    // Get user email for notification
+    db.query('SELECT email FROM users WHERE id = ?', [req.params.id], (err, userResults) => {
+      if (userResults && userResults.length > 0) {
+        createNotification(
+          req.params.id,
+          'system',
+          'Account Activated ✓',
+          'Your account has been activated by admin. You can now log in.',
+          null
+        );
+      }
+    });
+    
+    res.json({ success: true, message: 'User activated successfully' });
+  });
+});
+
+// Deactivate user (admin only)
+app.put('/api/admin/users/:id/deactivate', authMiddleware, adminMiddleware, (req, res) => {
+  db.query('UPDATE users SET is_active = 0 WHERE id = ?', [req.params.id], (err, result) => {
+    if (err) {
+      console.error('Deactivate user error:', err);
+      return res.status(500).json({ success: false, message: 'Database error' });
+    }
+    
+    createNotification(
+      req.params.id,
+      'system',
+      'Account Deactivated',
+      'Your account has been deactivated by admin. Please contact support.',
+      null
+    );
+    
+    res.json({ success: true, message: 'User deactivated successfully' });
+  });
+});
+// ==================== ADMIN SETTINGS ENDPOINTS ====================
+
+// Get platform settings
+app.get('/api/admin/settings', authMiddleware, adminMiddleware, (req, res) => {
+  // For now, return default settings (you can store these in a settings table later)
+  const settings = {
+    site_name: 'CareerLink GH',
+    site_description: 'Find your dream job in Ghana',
+    contact_email: 'contact@careerlinkgh.com',
+    support_email: 'support@careerlinkgh.com',
+    max_jobs_per_employer: 10,
+    max_applications_per_job_seeker: 5,
+    featured_job_price: 50,
+    premium_subscription_price: 99,
+    email_verification_required: true,
+    job_posting_approval_required: false,
+    maintenance_mode: false,
+    maintenance_message: 'Site is under maintenance. Please check back later.'
+  };
+  
+  res.json({ success: true, data: settings });
+});
+
+// Update platform settings
+app.put('/api/admin/settings', authMiddleware, adminMiddleware, (req, res) => {
+  const settings = req.body;
+  // Here you would save to a settings table in the database
+  // For now, just return success
+  console.log('Settings updated:', settings);
+  res.json({ success: true, message: 'Settings saved successfully' });
+});
+
+// ==================== ADMIN REPORTS ENDPOINTS ====================
+
+// Export reports
+app.post('/api/reports/export', authMiddleware, (req, res) => {
+  const { type, dateRange, format } = req.body;
+  
+  // For demo purposes, create a simple CSV/PDF report
+  // In production, you would generate actual reports from database
+  
+  let reportData = '';
+  let filename = `report_${type}_${Date.now()}`;
+  let contentType = '';
+  
+  switch (type) {
+    case 'applications':
+      reportData = 'Application ID,Job Title,Applicant Name,Status,Applied Date\n123,Software Engineer,John Doe,Pending,2024-01-15';
+      break;
+    case 'jobs':
+      reportData = 'Job ID,Title,Company,Location,Posted Date,Status\n456,Frontend Developer,Tech Corp,Accra,2024-01-10,Active';
+      break;
+    case 'users':
+      reportData = 'User ID,Name,Email,Type,Joined Date,Status\n789,John Doe,john@email.com,Job Seeker,2024-01-01,Active';
+      break;
+    case 'revenue':
+      reportData = 'Month,Amount,Transactions\nJanuary,₵1,250,15\nFebruary,₵2,100,22';
+      break;
+    default:
+      reportData = 'Report data';
+  }
+  
+  if (format === 'csv') {
+    contentType = 'text/csv';
+    filename += '.csv';
+  } else if (format === 'excel') {
+    contentType = 'application/vnd.ms-excel';
+    filename += '.xls';
+  } else {
+    contentType = 'application/pdf';
+    filename += '.pdf';
+    // For PDF, you'd need a PDF generator library
+    reportData = 'PDF report generation would go here';
+  }
+  
+  res.setHeader('Content-Type', contentType);
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(reportData);
+});
+
+// ==================== ADMIN DASHBOARD STATS ENHANCED ====================
+
+// Get enhanced admin stats
+app.get('/api/admin/dashboard-stats', authMiddleware, adminMiddleware, (req, res) => {
+  const queries = {
+    totalUsers: 'SELECT COUNT(*) as count FROM users',
+    totalEmployers: 'SELECT COUNT(*) as count FROM users WHERE user_type = "employer"',
+    totalJobSeekers: 'SELECT COUNT(*) as count FROM users WHERE user_type = "job_seeker"',
+    totalJobs: 'SELECT COUNT(*) as count FROM jobs',
+    activeJobs: 'SELECT COUNT(*) as count FROM jobs WHERE is_active = true',
+    totalApplications: 'SELECT COUNT(*) as count FROM applications',
+    pendingApplications: 'SELECT COUNT(*) as count FROM applications WHERE status = "pending"',
+    verifiedCompanies: 'SELECT COUNT(*) as count FROM employers WHERE verified = true',
+    featuredJobs: 'SELECT COUNT(*) as count FROM jobs WHERE is_featured = true',
+    totalNotifications: 'SELECT COUNT(*) as count FROM notifications',
+    unreadNotifications: 'SELECT COUNT(*) as count FROM notifications WHERE is_read = false',
+    // Recent activity (last 7 days)
+    newUsersThisWeek: 'SELECT COUNT(*) as count FROM users WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)',
+    newJobsThisWeek: 'SELECT COUNT(*) as count FROM jobs WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)',
+    newApplicationsThisWeek: 'SELECT COUNT(*) as count FROM applications WHERE applied_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)'
+  };
+  
+  const results = {};
+  let completed = 0;
+  const totalQueries = Object.keys(queries).length;
+  
+  for (const [key, query] of Object.entries(queries)) {
+    db.query(query, (err, result) => {
+      if (err) {
+        console.error(`Stats error for ${key}:`, err);
+        results[key] = 0;
+      } else {
+        results[key] = result[0].count;
+      }
+      completed++;
+      
+      if (completed === totalQueries) {
+        // Get recent activity for timeline
+        db.query(
+          `SELECT 
+            DATE(created_at) as date, 
+            COUNT(*) as count,
+            'users' as type
+          FROM users 
+          WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+          GROUP BY DATE(created_at)
+          UNION ALL
+          SELECT 
+            DATE(created_at) as date, 
+            COUNT(*) as count,
+            'jobs' as type
+          FROM jobs 
+          WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+          GROUP BY DATE(created_at)
+          ORDER BY date DESC
+          LIMIT 30`,
+          (err, activityResults) => {
+            results.recentActivity = activityResults || [];
+            res.json({ success: true, data: results });
+          }
+        );
+      }
+    });
+  }
+});
+
+// ==================== USER MANAGEMENT ENHANCEMENTS ====================
+
+// Get user by ID (admin)
+app.get('/api/admin/users/:id', authMiddleware, adminMiddleware, (req, res) => {
+  db.query(
+    `SELECT u.*, 
+            e.company_name, e.company_logo, e.verified as company_verified,
+            js.headline, js.location, js.experience_years, js.skills
+     FROM users u
+     LEFT JOIN employers e ON u.id = e.user_id
+     LEFT JOIN job_seekers js ON u.id = js.user_id
+     WHERE u.id = ?`,
+    [req.params.id],
+    (err, results) => {
+      if (err) {
+        console.error('Get user error:', err);
+        return res.status(500).json({ success: false, message: 'Database error' });
+      }
+      if (results.length === 0) {
+        return res.status(404).json({ success: false, message: 'User not found' });
+      }
+      res.json({ success: true, data: results[0] });
+    }
+  );
+});
+
+// Update user role (admin)
+app.put('/api/admin/users/:id/role', authMiddleware, adminMiddleware, (req, res) => {
+  const { user_type } = req.body;
+  
+  if (!['job_seeker', 'employer', 'admin'].includes(user_type)) {
+    return res.status(400).json({ success: false, message: 'Invalid user type' });
+  }
+  
+  db.query('UPDATE users SET user_type = ? WHERE id = ?', [user_type, req.params.id], (err, result) => {
+    if (err) {
+      console.error('Update user role error:', err);
+      return res.status(500).json({ success: false, message: 'Database error' });
+    }
+    
+    createNotification(
+      req.params.id,
+      'system',
+      'Account Role Updated',
+      `Your account role has been changed to ${user_type.replace('_', ' ')} by admin.`,
+      null
+    );
+    
+    res.json({ success: true, message: 'User role updated successfully' });
+  });
+});
 
 // 404 handler
 app.use('*', (req, res) => {
