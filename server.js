@@ -8,22 +8,31 @@ const { v4: uuidv4 } = require('uuid');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
 dotenv.config();
+
+// Configure Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-// Helper function to generate correct file URLs (HTTPS for production)
-const getFileUrl = (req, filename) => {
+// Helper function to generate correct file URLs
+const getFileUrl = (req, file) => {
+  if (process.env.CLOUDINARY_CLOUD_NAME && file.url) {
+    return file.url;
+  }
   const host = req.get('host');
-  
-  // If behind a reverse proxy (like Render)
+  const filename = file.filename || file;
   if (req.get('x-forwarded-proto') === 'https' || process.env.NODE_ENV === 'production') {
     return `https://${host}/uploads/${filename}`;
   }
-  
-  // Local development
   return `${req.protocol}://${host}/uploads/${filename}`;
 };
 
@@ -37,14 +46,13 @@ if (!fs.existsSync(uploadDir)) {
 app.use(cors());
 app.use(express.json());
 
-// Database connection - FIXED for Aiven MySQL (cloud database)
+// Database connection
 const db = mysql.createConnection({
   host: process.env.DB_HOST || 'localhost',
   user: process.env.DB_USER || 'root',
   password: process.env.DB_PASSWORD || '',
   database: process.env.DB_NAME || 'careerlinkgh_db',
   port: process.env.DB_PORT || 3306,
-  // Add SSL for Aiven cloud database
   ssl: process.env.DB_HOST ? { rejectUnauthorized: false } : null
 });
 
@@ -53,11 +61,42 @@ db.connect(err => {
     console.log('❌ Database connection failed:', err.message);
   } else {
     console.log('✅ Database connected successfully');
+    
+    // Create notifications table after DB connection
+    const createNotificationsTable = `
+      CREATE TABLE IF NOT EXISTS notifications (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL,
+        type ENUM('application', 'new_application', 'application_update', 'job_alert', 'message', 'system', 'interview') NOT NULL,
+        title VARCHAR(255) NOT NULL,
+        message TEXT NOT NULL,
+        related_id VARCHAR(36),
+        is_read BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        read_at TIMESTAMP NULL,
+        INDEX idx_user_id (user_id),
+        INDEX idx_created_at (created_at),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `;
+    
+    db.query(createNotificationsTable, (err) => {
+      if (err) {
+        console.error('Error creating notifications table:', err);
+      } else {
+        console.log('✅ Notifications table ready');
+      }
+    });
   }
 });
 
 // Helper function to create notification
 const createNotification = (userId, type, title, message, relatedId = null) => {
+  if (!userId) {
+    console.error('Cannot create notification: userId is required');
+    return;
+  }
+  
   const notificationId = uuidv4();
   db.query(
     'INSERT INTO notifications (id, user_id, type, title, message, related_id, is_read, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, NOW())',
@@ -76,19 +115,12 @@ const createNotification = (userId, type, title, message, relatedId = null) => {
 const authMiddleware = (req, res, next) => {
   try {
     const token = req.header('Authorization')?.replace('Bearer ', '');
-    
-    if (!token) {
-      throw new Error();
-    }
-
+    if (!token) throw new Error();
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'careerlinkgh_secret_key_2024');
     req.user = decoded;
     next();
   } catch (error) {
-    res.status(401).json({ 
-      success: false, 
-      message: 'Please authenticate' 
-    });
+    res.status(401).json({ success: false, message: 'Please authenticate' });
   }
 };
 
@@ -99,10 +131,6 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password, first_name, last_name, phone, user_type, company_name } = req.body;
     
-    console.log('📝 Register attempt for:', email);
-    console.log('📝 User type:', user_type);
-    console.log('📝 Company name received:', company_name);
-
     db.query('SELECT * FROM users WHERE email = ?', [email], async (err, results) => {
       if (err) {
         console.error('Database error:', err);
@@ -129,11 +157,7 @@ app.post('/api/auth/register', async (req, res) => {
           if (user_type === 'employer') {
             const employerId = uuidv4();
             const companyName = company_name || `${first_name}'s Company`;
-            console.log('📝 Creating employer with company name:', companyName);
-            db.query(
-              'INSERT INTO employers (id, user_id, company_name) VALUES (?, ?, ?)',
-              [employerId, userId, companyName]
-            );
+            db.query('INSERT INTO employers (id, user_id, company_name) VALUES (?, ?, ?)', [employerId, userId, companyName]);
           } else if (user_type === 'job_seeker') {
             const seekerId = uuidv4();
             db.query('INSERT INTO job_seekers (id, user_id) VALUES (?, ?)', [seekerId, userId]);
@@ -166,8 +190,6 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', (req, res) => {
   const { email, password } = req.body;
   
-  console.log('🔑 Login attempt for:', email);
-
   db.query('SELECT * FROM users WHERE email = ?', [email], async (err, results) => {
     if (err) {
       console.error('Database error:', err);
@@ -226,11 +248,9 @@ app.get('/api/auth/me', authMiddleware, (req, res) => {
         console.error('Database error:', err);
         return res.status(500).json({ success: false, message: 'Database error' });
       }
-      
       if (results.length === 0) {
         return res.status(404).json({ success: false, message: 'User not found' });
       }
-
       res.json({ success: true, data: results[0] });
     }
   );
@@ -249,7 +269,7 @@ app.get('/api/categories', (req, res) => {
 
 // ==================== JOBS CRUD ====================
 
-// Create job (employer only) - UPDATES employer counts
+// Create job (employer only)
 app.post('/api/jobs', authMiddleware, (req, res) => {
   if (req.user.user_type !== 'employer') {
     return res.status(403).json({ success: false, message: 'Only employers can post jobs' });
@@ -293,12 +313,8 @@ app.post('/api/jobs', authMiddleware, (req, res) => {
           return res.status(500).json({ success: false, message: 'Failed to create job' });
         }
 
-        // Update employer's job counts
         db.query(
-          `UPDATE employers SET 
-            total_jobs_posted = total_jobs_posted + 1,
-            active_jobs = active_jobs + 1
-           WHERE id = ?`,
+          `UPDATE employers SET total_jobs_posted = total_jobs_posted + 1, active_jobs = active_jobs + 1 WHERE id = ?`,
           [employer_id]
         );
 
@@ -363,28 +379,6 @@ app.get('/api/jobs', (req, res) => {
   });
 });
 
-// Get featured jobs
-app.get('/api/jobs/featured', (req, res) => {
-  const limit = parseInt(req.query.limit) || 6;
-  
-  db.query(
-    `SELECT j.*, e.company_name, e.company_logo
-     FROM jobs j
-     LEFT JOIN employers e ON j.employer_id = e.id
-     WHERE j.is_featured = true AND j.is_active = true
-     ORDER BY j.created_at DESC
-     LIMIT ?`,
-    [limit],
-    (err, results) => {
-      if (err) {
-        console.error('Database error:', err);
-        return res.status(500).json({ success: false, message: 'Database error' });
-      }
-      res.json({ success: true, data: results });
-    }
-  );
-});
-
 // Get single job by ID
 app.get('/api/jobs/:id', (req, res) => {
   db.query('UPDATE jobs SET views_count = views_count + 1 WHERE id = ?', [req.params.id]);
@@ -403,134 +397,15 @@ app.get('/api/jobs/:id', (req, res) => {
         console.error('Database error:', err);
         return res.status(500).json({ success: false, message: 'Database error' });
       }
-      
       if (results.length === 0) {
         return res.status(404).json({ success: false, message: 'Job not found' });
       }
-
       res.json({ success: true, data: results[0] });
     }
   );
 });
 
-// Update job (employer only)
-app.put('/api/jobs/:id', authMiddleware, (req, res) => {
-  if (req.user.user_type !== 'employer') {
-    return res.status(403).json({ success: false, message: 'Only employers can update jobs' });
-  }
-
-  db.query('SELECT id FROM employers WHERE user_id = ?', [req.user.id], (err, employerResults) => {
-    if (err || employerResults.length === 0) {
-      return res.status(400).json({ success: false, message: 'Employer profile not found' });
-    }
-
-    const employer_id = employerResults[0].id;
-
-    db.query('SELECT * FROM jobs WHERE id = ? AND employer_id = ?', [req.params.id, employer_id], (err, jobResults) => {
-      if (err || jobResults.length === 0) {
-        return res.status(403).json({ success: false, message: 'Unauthorized to update this job' });
-      }
-
-      const {
-        title, description, requirements, benefits, job_type,
-        experience_level, category_id, location, is_remote,
-        salary_min, salary_max, salary_currency, application_deadline,
-        is_featured, is_urgent, is_active
-      } = req.body;
-
-      let slug;
-      if (title) {
-        slug = title.toLowerCase()
-          .replace(/[^a-z0-9]+/g, '-')
-          .replace(/(^-|-$)/g, '');
-      }
-
-      db.query(
-        `UPDATE jobs SET
-          title = COALESCE(?, title),
-          slug = COALESCE(?, slug),
-          description = COALESCE(?, description),
-          requirements = COALESCE(?, requirements),
-          benefits = COALESCE(?, benefits),
-          job_type = COALESCE(?, job_type),
-          experience_level = COALESCE(?, experience_level),
-          category_id = COALESCE(?, category_id),
-          location = COALESCE(?, location),
-          is_remote = COALESCE(?, is_remote),
-          salary_min = COALESCE(?, salary_min),
-          salary_max = COALESCE(?, salary_max),
-          salary_currency = COALESCE(?, salary_currency),
-          application_deadline = COALESCE(?, application_deadline),
-          is_featured = COALESCE(?, is_featured),
-          is_urgent = COALESCE(?, is_urgent),
-          is_active = COALESCE(?, is_active)
-        WHERE id = ?`,
-        [
-          title, slug, description, requirements, benefits,
-          job_type, experience_level, category_id, location, is_remote,
-          salary_min, salary_max, salary_currency, application_deadline,
-          is_featured, is_urgent, is_active, req.params.id
-        ],
-        (err, result) => {
-          if (err) {
-            console.error('Update error:', err);
-            return res.status(500).json({ success: false, message: 'Failed to update job' });
-          }
-
-          res.json({ success: true, message: 'Job updated successfully' });
-        }
-      );
-    });
-  });
-});
-
-// Delete job (employer only) - UPDATES employer counts
-app.delete('/api/jobs/:id', authMiddleware, (req, res) => {
-  if (req.user.user_type !== 'employer') {
-    return res.status(403).json({ success: false, message: 'Only employers can delete jobs' });
-  }
-
-  db.query('SELECT id FROM employers WHERE user_id = ?', [req.user.id], (err, employerResults) => {
-    if (err || employerResults.length === 0) {
-      return res.status(400).json({ success: false, message: 'Employer profile not found' });
-    }
-
-    const employer_id = employerResults[0].id;
-
-    db.query('SELECT is_active FROM jobs WHERE id = ? AND employer_id = ?', [req.params.id, employer_id], (err, jobResults) => {
-      if (err || jobResults.length === 0) {
-        return res.status(404).json({ success: false, message: 'Job not found' });
-      }
-
-      const wasActive = jobResults[0].is_active === 1;
-
-      db.query('DELETE FROM jobs WHERE id = ? AND employer_id = ?', [req.params.id, employer_id], (err, result) => {
-        if (err) {
-          console.error('Delete error:', err);
-          return res.status(500).json({ success: false, message: 'Failed to delete job' });
-        }
-
-        if (result.affectedRows === 0) {
-          return res.status(404).json({ success: false, message: 'Job not found or unauthorized' });
-        }
-
-        if (wasActive) {
-          db.query(
-            `UPDATE employers SET 
-              total_jobs_posted = GREATEST(total_jobs_posted - 1, 0),
-              active_jobs = GREATEST(active_jobs - 1, 0)
-             WHERE id = ?`,
-            [employer_id]
-          );
-        }
-
-        res.json({ success: true, message: 'Job deleted successfully' });
-      });
-    });
-  });
-});
-
-// ==================== APPLICATIONS ====================
+// ==================== APPLICATIONS WITH NOTIFICATIONS ====================
 
 // Apply for a job
 app.post('/api/jobs/:jobId/apply', authMiddleware, (req, res) => {
@@ -560,15 +435,14 @@ app.post('/api/jobs/:jobId/apply', authMiddleware, (req, res) => {
           return res.status(400).json({ success: false, message: 'Already applied for this job' });
         }
 
-        // Get job details for notification
-        db.query('SELECT title, employer_id FROM jobs WHERE id = ?', [req.params.jobId], (err, jobResults) => {
+        db.query('SELECT j.title, j.employer_id, e.user_id as employer_user_id FROM jobs j LEFT JOIN employers e ON j.employer_id = e.id WHERE j.id = ?', [req.params.jobId], (err, jobResults) => {
           if (err || jobResults.length === 0) {
             console.error('Job not found:', err);
             return res.status(400).json({ success: false, message: 'Job not found' });
           }
 
           const jobTitle = jobResults[0].title;
-          const employerId = jobResults[0].employer_id;
+          const employerUserId = jobResults[0].employer_user_id;
 
           db.query(
             'INSERT INTO applications (id, job_id, job_seeker_id, cover_letter, resume_url) VALUES (?, ?, ?, ?, ?)',
@@ -581,40 +455,27 @@ app.post('/api/jobs/:jobId/apply', authMiddleware, (req, res) => {
 
               db.query('UPDATE jobs SET applications_count = applications_count + 1 WHERE id = ?', [req.params.jobId]);
 
-              // Create notification for job seeker
+              // Notification for job seeker
               createNotification(
                 req.user.id,
                 'application',
                 'Application Submitted',
-                `You have successfully applied for the job: ${jobTitle}`,
+                `You have successfully applied for "${jobTitle}"`,
                 req.params.jobId
               );
 
-              // Get employer user_id to send them a notification
-              db.query('SELECT user_id FROM employers WHERE id = ?', [employerId], (err, empResults) => {
-                if (empResults && empResults.length > 0) {
-                  const employerUserId = empResults[0].user_id;
-                  
-                  // Get seeker's name for notification
-                  db.query(
-                    'SELECT first_name, last_name FROM users WHERE id = ?',
-                    [req.user.id],
-                    (err, userResults) => {
-                      if (userResults && userResults.length > 0) {
-                        const seekerName = `${userResults[0].first_name} ${userResults[0].last_name}`;
-                        
-                        // Create notification for employer
-                        createNotification(
-                          employerUserId,
-                          'new_application',
-                          'New Job Application',
-                          `${seekerName} has applied for your job: ${jobTitle}`,
-                          req.params.jobId
-                        );
-                      }
-                    }
-                  );
-                }
+              // Get seeker's name for employer notification
+              db.query('SELECT first_name, last_name FROM users WHERE id = ?', [req.user.id], (err, userResults) => {
+                const seekerName = userResults && userResults.length > 0 ? `${userResults[0].first_name} ${userResults[0].last_name}` : 'A candidate';
+                
+                // Notification for employer
+                createNotification(
+                  employerUserId,
+                  'new_application',
+                  'New Application Received',
+                  `${seekerName} has applied for "${jobTitle}"`,
+                  req.params.jobId
+                );
               });
 
               res.status(201).json({
@@ -628,6 +489,109 @@ app.post('/api/jobs/:jobId/apply', authMiddleware, (req, res) => {
       }
     );
   });
+});
+
+// Update application status (employer only) - WITH FIXED NOTIFICATIONS
+app.put('/api/applications/:id/status', authMiddleware, (req, res) => {
+  if (req.user.user_type !== 'employer') {
+    return res.status(403).json({ success: false, message: 'Access denied' });
+  }
+
+  const { status, interview_date, interview_notes } = req.body;
+
+  db.query(
+    `SELECT a.id, a.job_id, a.job_seeker_id, j.title, j.employer_id 
+     FROM applications a
+     LEFT JOIN jobs j ON a.job_id = j.id
+     LEFT JOIN employers e ON j.employer_id = e.id
+     WHERE a.id = ? AND e.user_id = ?`,
+    [req.params.id, req.user.id],
+    (err, results) => {
+      if (err || results.length === 0) {
+        return res.status(403).json({ success: false, message: 'Unauthorized' });
+      }
+
+      const application = results[0];
+      const jobTitle = application.title;
+
+      db.query(
+        `UPDATE applications 
+         SET status = ?, interview_date = ?, interview_notes = ?, updated_at = NOW()
+         WHERE id = ?`,
+        [status, interview_date, interview_notes, req.params.id],
+        (err, result) => {
+          if (err) {
+            console.error('Update error:', err);
+            return res.status(500).json({ success: false, message: 'Failed to update status' });
+          }
+
+          // Get job seeker's user_id and name
+          db.query(
+            'SELECT js.user_id, u.first_name, u.last_name FROM job_seekers js LEFT JOIN users u ON js.user_id = u.id WHERE js.id = ?',
+            [application.job_seeker_id],
+            (err, seekerResults) => {
+              if (seekerResults && seekerResults.length > 0) {
+                const seekerUserId = seekerResults[0].user_id;
+                const seekerName = `${seekerResults[0].first_name || ''} ${seekerResults[0].last_name || ''}`.trim() || 'Candidate';
+
+                let notificationTitle = 'Application Status Updated';
+                let notificationMessage = `Your application for "${jobTitle}" has been ${status}`;
+                let employerNotificationTitle = 'Application Status Updated';
+                let employerNotificationMessage = `You have ${status} the application from ${seekerName} for "${jobTitle}"`;
+
+                switch(status) {
+                  case 'shortlisted':
+                    notificationTitle = '🎉 Shortlisted!';
+                    notificationMessage = `Great news! You've been shortlisted for "${jobTitle}"`;
+                    employerNotificationTitle = 'Application Shortlisted';
+                    employerNotificationMessage = `You have shortlisted ${seekerName} for "${jobTitle}"`;
+                    break;
+                  case 'interview':
+                    notificationTitle = '📅 Interview Scheduled';
+                    notificationMessage = `You have an interview scheduled for "${jobTitle}"${interview_date ? ` on ${new Date(interview_date).toLocaleDateString()}` : ''}`;
+                    employerNotificationTitle = 'Interview Scheduled';
+                    employerNotificationMessage = `You have scheduled an interview with ${seekerName} for "${jobTitle}"${interview_date ? ` on ${new Date(interview_date).toLocaleDateString()}` : ''}`;
+                    break;
+                  case 'accepted':
+                    notificationTitle = '🎉 Congratulations!';
+                    notificationMessage = `Congratulations! Your application for "${jobTitle}" has been accepted!`;
+                    employerNotificationTitle = 'Application Accepted';
+                    employerNotificationMessage = `You have accepted the application from ${seekerName} for "${jobTitle}"`;
+                    break;
+                  case 'rejected':
+                    notificationTitle = 'Application Update';
+                    notificationMessage = `Your application for "${jobTitle}" was not successful this time. Keep trying!`;
+                    employerNotificationTitle = 'Application Rejected';
+                    employerNotificationMessage = `You have rejected the application from ${seekerName} for "${jobTitle}"`;
+                    break;
+                }
+
+                // Send notification to job seeker
+                createNotification(
+                  seekerUserId,
+                  'application_update',
+                  notificationTitle,
+                  notificationMessage,
+                  application.job_id
+                );
+
+                // Send notification to employer
+                createNotification(
+                  req.user.id,
+                  'application_update',
+                  employerNotificationTitle,
+                  employerNotificationMessage,
+                  application.job_id
+                );
+              }
+            }
+          );
+
+          res.json({ success: true, message: 'Application status updated' });
+        }
+      );
+    }
+  );
 });
 
 // Get user's applications
@@ -697,91 +661,7 @@ app.get('/api/jobs/:jobId/applications', authMiddleware, (req, res) => {
   });
 });
 
-// Update application status (employer only)
-app.put('/api/applications/:id/status', authMiddleware, (req, res) => {
-  if (req.user.user_type !== 'employer') {
-    return res.status(403).json({ success: false, message: 'Access denied' });
-  }
-
-  const { status, interview_date, interview_notes } = req.body;
-
-  db.query(
-    `SELECT a.id, a.job_id, a.job_seeker_id, j.title FROM applications a
-     LEFT JOIN jobs j ON a.job_id = j.id
-     LEFT JOIN employers e ON j.employer_id = e.id
-     WHERE a.id = ? AND e.user_id = ?`,
-    [req.params.id, req.user.id],
-    (err, results) => {
-      if (err || results.length === 0) {
-        return res.status(403).json({ success: false, message: 'Unauthorized' });
-      }
-
-      const application = results[0];
-      const jobTitle = application.title;
-
-      db.query(
-        `UPDATE applications 
-         SET status = ?, interview_date = ?, interview_notes = ?, updated_at = NOW()
-         WHERE id = ?`,
-        [status, interview_date, interview_notes, req.params.id],
-        (err, result) => {
-          if (err) {
-            console.error('Update error:', err);
-            return res.status(500).json({ success: false, message: 'Failed to update status' });
-          }
-
-          // Get job seeker's user_id to send notification
-          db.query(
-            'SELECT user_id FROM job_seekers WHERE id = ?',
-            [application.job_seeker_id],
-            (err, seekerResults) => {
-              if (seekerResults && seekerResults.length > 0) {
-                const seekerUserId = seekerResults[0].user_id;
-
-                // Create status-specific notification messages
-                let notificationTitle = 'Application Status Updated';
-                let notificationMessage = `Your application for ${jobTitle} has been ${status}`;
-
-                switch(status) {
-                  case 'shortlisted':
-                    notificationTitle = '🎉 Shortlisted!';
-                    notificationMessage = `Great news! You've been shortlisted for ${jobTitle}`;
-                    break;
-                  case 'interview':
-                    notificationTitle = '📅 Interview Scheduled';
-                    notificationMessage = `You have an interview scheduled for ${jobTitle}${interview_date ? ` on ${new Date(interview_date).toLocaleDateString()}` : ''}`;
-                    break;
-                  case 'accepted':
-                    notificationTitle = '🎉 Congratulations!';
-                    notificationMessage = `Congratulations! Your application for ${jobTitle} has been accepted!`;
-                    break;
-                  case 'rejected':
-                    notificationTitle = 'Application Update';
-                    notificationMessage = `Your application for ${jobTitle} was not successful this time. Keep trying!`;
-                    break;
-                }
-
-                createNotification(
-                  seekerUserId,
-                  'application_update',
-                  notificationTitle,
-                  notificationMessage,
-                  application.job_id
-                );
-              }
-            }
-          );
-
-          res.json({ success: true, message: 'Application status updated' });
-        }
-      );
-    }
-  );
-});
-
 // ==================== SAVED JOBS ====================
-
-// Save a job
 app.post('/api/jobs/:jobId/save', authMiddleware, (req, res) => {
   if (req.user.user_type !== 'job_seeker') {
     return res.status(403).json({ success: false, message: 'Only job seekers can save jobs' });
@@ -808,7 +688,6 @@ app.post('/api/jobs/:jobId/save', authMiddleware, (req, res) => {
   });
 });
 
-// Unsave a job
 app.delete('/api/jobs/:jobId/save', authMiddleware, (req, res) => {
   if (req.user.user_type !== 'job_seeker') {
     return res.status(403).json({ success: false, message: 'Only job seekers can unsave jobs' });
@@ -835,7 +714,6 @@ app.delete('/api/jobs/:jobId/save', authMiddleware, (req, res) => {
   });
 });
 
-// Get saved jobs
 app.get('/api/saved-jobs', authMiddleware, (req, res) => {
   if (req.user.user_type !== 'job_seeker') {
     return res.status(403).json({ success: false, message: 'Access denied' });
@@ -861,17 +739,12 @@ app.get('/api/saved-jobs', authMiddleware, (req, res) => {
 });
 
 // ==================== NOTIFICATION ROUTES ====================
-
-// Get user notifications
 app.get('/api/notifications', authMiddleware, (req, res) => {
   const limit = parseInt(req.query.limit) || 20;
   const offset = parseInt(req.query.offset) || 0;
   
   db.query(
-    `SELECT * FROM notifications 
-     WHERE user_id = (SELECT id FROM users WHERE id = ?)
-     ORDER BY created_at DESC 
-     LIMIT ? OFFSET ?`,
+    `SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
     [req.user.id, limit, offset],
     (err, results) => {
       if (err) {
@@ -887,129 +760,74 @@ app.get('/api/notifications', authMiddleware, (req, res) => {
             return res.json({ success: true, data: results, unread: 0 });
           }
           
-          res.json({ 
-            success: true, 
-            data: results,
-            unread: countResult[0].unread
-          });
+          res.json({ success: true, data: results, unread: countResult[0].unread });
         }
       );
     }
   );
 });
 
-// Configure storage for file uploads
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    const uploadDir = 'uploads/';
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  }
-});
-
-const fileFilter = (req, file, cb) => {
-  if (file.mimetype.startsWith('image/') || file.mimetype === 'application/pdf') {
-    cb(null, true);
-  } else {
-    cb(new Error('Only images and PDFs are allowed'), false);
-  }
-};
-
-const upload = multer({ 
-  storage: storage,
-  fileFilter: fileFilter,
-  limits: { fileSize: 5 * 1024 * 1024 }
-});
-
-// Serve uploaded files statically
-app.use('/uploads', express.static('uploads'));
-
-// ==================== FILE UPLOAD ROUTES ====================
-
-// Upload profile picture
-app.post('/api/upload/profile-picture', authMiddleware, upload.single('image'), (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ success: false, message: 'No file uploaded' });
-  }
-
-  const fileUrl = getFileUrl(req, req.file.filename);
-  
-  db.query('UPDATE users SET avatar_url = ? WHERE id = ?', [fileUrl, req.user.id], (err, result) => {
+app.put('/api/notifications/:id/read', authMiddleware, (req, res) => {
+  db.query('UPDATE notifications SET is_read = true, read_at = NOW() WHERE id = ? AND user_id = ?', [req.params.id, req.user.id], (err, result) => {
     if (err) {
-      console.error('Database error:', err);
+      console.error('Mark read error:', err);
       return res.status(500).json({ success: false, message: 'Database error' });
     }
-    res.json({ success: true, message: 'Profile picture uploaded successfully', data: { url: fileUrl } });
+    res.json({ success: true, message: 'Notification marked as read' });
   });
 });
 
-// ==================== UPDATED SEEKER PROFILE ENDPOINTS (FOR RESUME BUILDER) ====================
+app.put('/api/notifications/read-all', authMiddleware, (req, res) => {
+  db.query('UPDATE notifications SET is_read = true, read_at = NOW() WHERE user_id = ? AND is_read = false', [req.user.id], (err, result) => {
+    if (err) {
+      console.error('Mark all read error:', err);
+      return res.status(500).json({ success: false, message: 'Database error' });
+    }
+    res.json({ success: true, message: 'All notifications marked as read', count: result.affectedRows });
+  });
+});
 
-// UPDATE: Enhanced PUT endpoint for seeker profile (supports all resume fields)
+app.delete('/api/notifications/:id', authMiddleware, (req, res) => {
+  db.query('DELETE FROM notifications WHERE id = ? AND user_id = ?', [req.params.id, req.user.id], (err, result) => {
+    if (err) {
+      console.error('Delete notification error:', err);
+      return res.status(500).json({ success: false, message: 'Database error' });
+    }
+    res.json({ success: true, message: 'Notification deleted' });
+  });
+});
+
+app.get('/api/notifications/unread-count', authMiddleware, (req, res) => {
+  db.query('SELECT COUNT(*) as count FROM notifications WHERE user_id = ? AND is_read = false', [req.user.id], (err, results) => {
+    if (err) {
+      console.error('Unread count error:', err);
+      return res.status(500).json({ success: false, message: 'Database error' });
+    }
+    res.json({ success: true, data: { unread: results[0].count } });
+  });
+});
+
+// ==================== SEEKER PROFILE ENDPOINTS ====================
 app.put('/api/seeker/profile', authMiddleware, (req, res) => {
   if (req.user.user_type !== 'job_seeker') {
     return res.status(403).json({ success: false, message: 'Access denied' });
   }
 
-  const { 
-    headline, location, skills, experience_years, 
-    current_salary, expected_salary, summary, 
-    bio, experiences, educations 
-  } = req.body;
+  const { headline, location, skills, experience_years, current_salary, expected_salary, summary, bio, experiences, educations } = req.body;
 
-  // Build dynamic update query
   const updates = [];
   const values = [];
 
-  if (headline !== undefined) {
-    updates.push('headline = ?');
-    values.push(headline);
-  }
-  if (location !== undefined) {
-    updates.push('location = ?');
-    values.push(location);
-  }
-  if (skills !== undefined) {
-    const skillsJson = typeof skills === 'string' ? skills : JSON.stringify(skills);
-    updates.push('skills = ?');
-    values.push(skillsJson);
-  }
-  if (experience_years !== undefined) {
-    updates.push('experience_years = ?');
-    values.push(experience_years);
-  }
-  if (current_salary !== undefined) {
-    updates.push('current_salary = ?');
-    values.push(current_salary);
-  }
-  if (expected_salary !== undefined) {
-    updates.push('expected_salary = ?');
-    values.push(expected_salary);
-  }
-  if (summary !== undefined) {
-    updates.push('summary = ?');
-    values.push(summary);
-  }
-  if (bio !== undefined) {
-    updates.push('bio = ?');
-    values.push(bio);
-  }
-  if (experiences !== undefined) {
-    const experiencesJson = typeof experiences === 'string' ? experiences : JSON.stringify(experiences);
-    updates.push('experiences = ?');
-    values.push(experiencesJson);
-  }
-  if (educations !== undefined) {
-    const educationsJson = typeof educations === 'string' ? educations : JSON.stringify(educations);
-    updates.push('educations = ?');
-    values.push(educationsJson);
-  }
+  if (headline !== undefined) { updates.push('headline = ?'); values.push(headline); }
+  if (location !== undefined) { updates.push('location = ?'); values.push(location); }
+  if (skills !== undefined) { updates.push('skills = ?'); values.push(typeof skills === 'string' ? skills : JSON.stringify(skills)); }
+  if (experience_years !== undefined) { updates.push('experience_years = ?'); values.push(experience_years); }
+  if (current_salary !== undefined) { updates.push('current_salary = ?'); values.push(current_salary); }
+  if (expected_salary !== undefined) { updates.push('expected_salary = ?'); values.push(expected_salary); }
+  if (summary !== undefined) { updates.push('summary = ?'); values.push(summary); }
+  if (bio !== undefined) { updates.push('bio = ?'); values.push(bio); }
+  if (experiences !== undefined) { updates.push('experiences = ?'); values.push(typeof experiences === 'string' ? experiences : JSON.stringify(experiences)); }
+  if (educations !== undefined) { updates.push('educations = ?'); values.push(typeof educations === 'string' ? educations : JSON.stringify(educations)); }
 
   if (updates.length === 0) {
     return res.status(400).json({ success: false, message: 'No fields to update' });
@@ -1025,12 +843,10 @@ app.put('/api/seeker/profile', authMiddleware, (req, res) => {
       console.error('Database error:', err);
       return res.status(500).json({ success: false, message: 'Database error: ' + err.message });
     }
-    
     res.json({ success: true, message: 'Profile updated successfully' });
   });
 });
 
-// UPDATE: Enhanced GET endpoint for seeker profile (returns all resume data)
 app.get('/api/seeker/profile', authMiddleware, (req, res) => {
   if (req.user.user_type !== 'job_seeker') {
     return res.status(403).json({ success: false, message: 'Access denied' });
@@ -1050,80 +866,104 @@ app.get('/api/seeker/profile', authMiddleware, (req, res) => {
         console.error('Database error:', err);
         return res.status(500).json({ success: false, message: 'Database error' });
       }
-      
       if (results.length === 0) {
         return res.status(404).json({ success: false, message: 'Profile not found' });
       }
       
       const profile = results[0];
-      
-      // Parse JSON fields if they exist and are strings
-      if (profile.skills && typeof profile.skills === 'string') {
-        try {
-          profile.skills = JSON.parse(profile.skills);
-        } catch(e) {
-          profile.skills = [];
-        }
-      }
-      
-      if (profile.experiences && typeof profile.experiences === 'string') {
-        try {
-          profile.experiences = JSON.parse(profile.experiences);
-        } catch(e) {
-          profile.experiences = [];
-        }
-      }
-      
-      if (profile.educations && typeof profile.educations === 'string') {
-        try {
-          profile.educations = JSON.parse(profile.educations);
-        } catch(e) {
-          profile.educations = [];
-        }
-      }
+      if (profile.skills && typeof profile.skills === 'string') { try { profile.skills = JSON.parse(profile.skills); } catch(e) { profile.skills = []; } }
+      if (profile.experiences && typeof profile.experiences === 'string') { try { profile.experiences = JSON.parse(profile.experiences); } catch(e) { profile.experiences = []; } }
+      if (profile.educations && typeof profile.educations === 'string') { try { profile.educations = JSON.parse(profile.educations); } catch(e) { profile.educations = []; } }
       
       res.json({ success: true, data: profile });
     }
   );
 });
 
-// Upload resume (for job seekers)
+app.put('/api/auth/profile', authMiddleware, (req, res) => {
+  const { first_name, last_name, phone, location, headline } = req.body;
+  
+  const userUpdates = [];
+  const userValues = [];
+  
+  if (first_name !== undefined) { userUpdates.push('first_name = ?'); userValues.push(first_name); }
+  if (last_name !== undefined) { userUpdates.push('last_name = ?'); userValues.push(last_name); }
+  if (phone !== undefined) { userUpdates.push('phone = ?'); userValues.push(phone); }
+  
+  if (userUpdates.length > 0) {
+    userUpdates.push('updated_at = NOW()');
+    userValues.push(req.user.id);
+    db.query(`UPDATE users SET ${userUpdates.join(', ')} WHERE id = ?`, userValues);
+  }
+  
+  if (location !== undefined || headline !== undefined) {
+    const seekerUpdates = [];
+    const seekerValues = [];
+    if (location !== undefined) { seekerUpdates.push('location = ?'); seekerValues.push(location); }
+    if (headline !== undefined) { seekerUpdates.push('headline = ?'); seekerValues.push(headline); }
+    if (seekerUpdates.length > 0) {
+      seekerUpdates.push('updated_at = NOW()');
+      seekerValues.push(req.user.id);
+      db.query(`UPDATE job_seekers SET ${seekerUpdates.join(', ')} WHERE user_id = ?`, seekerValues);
+    }
+  }
+  
+  res.json({ success: true, message: 'Profile updated successfully' });
+});
+
+// ==================== FILE UPLOAD CONFIGURATION ====================
+let storage;
+
+if (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET) {
+  storage = new CloudinaryStorage({
+    cloudinary: cloudinary,
+    params: { folder: 'careerlinkgh-uploads', allowed_formats: ['jpg', 'jpeg', 'png', 'pdf'], transformation: [{ width: 1000, height: 1000, crop: 'limit' }] }
+  });
+  console.log('📁 Using Cloudinary storage for file uploads');
+} else {
+  storage = multer.diskStorage({
+    destination: function (req, file, cb) { cb(null, 'uploads/'); },
+    filename: function (req, file, cb) { cb(null, Date.now() + '-' + Math.round(Math.random() * 1E9) + path.extname(file.originalname)); }
+  });
+  console.log('📁 Using local storage for file uploads');
+}
+
+const fileFilter = (req, file, cb) => {
+  if (file.mimetype.startsWith('image/') || file.mimetype === 'application/pdf') {
+    cb(null, true);
+  } else {
+    cb(new Error('Only images and PDFs are allowed'), false);
+  }
+};
+
+const upload = multer({ storage: storage, fileFilter: fileFilter, limits: { fileSize: 5 * 1024 * 1024 } });
+app.use('/uploads', express.static('uploads'));
+
 app.post('/api/upload/resume', authMiddleware, upload.single('resume'), (req, res) => {
   if (req.user.user_type !== 'job_seeker') {
     return res.status(403).json({ success: false, message: 'Only job seekers can upload resumes' });
   }
-
   if (!req.file) {
     return res.status(400).json({ success: false, message: 'No file uploaded' });
   }
-
   const fileUrl = getFileUrl(req, req.file.filename);
-  
-  db.query(
-    'UPDATE job_seekers SET resume_url = ? WHERE user_id = ?',
-    [fileUrl, req.user.id],
-    (err, result) => {
-      if (err) {
-        console.error('Database error:', err);
-        return res.status(500).json({ success: false, message: 'Database error' });
-      }
-      res.json({ success: true, message: 'Resume uploaded successfully', data: { url: fileUrl, filename: req.file.originalname } });
+  db.query('UPDATE job_seekers SET resume_url = ? WHERE user_id = ?', [fileUrl, req.user.id], (err, result) => {
+    if (err) {
+      console.error('Database error:', err);
+      return res.status(500).json({ success: false, message: 'Database error' });
     }
-  );
+    res.json({ success: true, message: 'Resume uploaded successfully', data: { url: fileUrl, filename: req.file.originalname } });
+  });
 });
 
-// Upload company logo (for employers)
 app.post('/api/upload/company-logo', authMiddleware, upload.single('logo'), (req, res) => {
   if (req.user.user_type !== 'employer') {
     return res.status(403).json({ success: false, message: 'Only employers can upload company logos' });
   }
-
   if (!req.file) {
     return res.status(400).json({ success: false, message: 'No file uploaded' });
   }
-
   const fileUrl = getFileUrl(req, req.file.filename);
-  
   db.query('UPDATE employers SET company_logo = ? WHERE user_id = ?', [fileUrl, req.user.id], (err, result) => {
     if (err) {
       console.error('Database error:', err);
@@ -1133,196 +973,15 @@ app.post('/api/upload/company-logo', authMiddleware, upload.single('logo'), (req
   });
 });
 
-// Mark notification as read
-app.put('/api/notifications/:id/read', authMiddleware, (req, res) => {
-  db.query('UPDATE notifications SET is_read = true, read_at = NOW() WHERE id = ? AND user_id = ?', [req.params.id, req.user.id], (err, result) => {
-    if (err) {
-      console.error('Mark read error:', err);
-      return res.status(500).json({ success: false, message: 'Database error' });
-    }
-    res.json({ success: true, message: 'Notification marked as read' });
-  });
-});
-
-// Mark all notifications as read
-app.put('/api/notifications/read-all', authMiddleware, (req, res) => {
-  db.query('UPDATE notifications SET is_read = true, read_at = NOW() WHERE user_id = ? AND is_read = false', [req.user.id], (err, result) => {
-    if (err) {
-      console.error('Mark all read error:', err);
-      return res.status(500).json({ success: false, message: 'Database error' });
-    }
-    res.json({ success: true, message: 'All notifications marked as read', count: result.affectedRows });
-  });
-});
-
-// ==================== AVATAR & PROFILE MANAGEMENT ====================
-
-// Upload avatar (profile picture)
-app.post('/api/auth/avatar', authMiddleware, upload.single('avatar'), (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ success: false, message: 'No file uploaded' });
-  }
-
-  if (!req.file.mimetype.startsWith('image/')) {
-    return res.status(400).json({ success: false, message: 'Only image files are allowed' });
-  }
-
-  if (req.file.size > 2 * 1024 * 1024) {
-    return res.status(400).json({ success: false, message: 'File size must be less than 2MB' });
-  }
-
-  const fileUrl = getFileUrl(req, req.file.filename);
-  
-  db.query('UPDATE users SET avatar_url = ? WHERE id = ?', [fileUrl, req.user.id], (err, result) => {
-    if (err) {
-      console.error('Database error:', err);
-      return res.status(500).json({ success: false, message: 'Database error' });
-    }
-    res.json({ success: true, message: 'Avatar uploaded successfully', data: { url: fileUrl } });
-  });
-});
-
-// Remove avatar
-app.delete('/api/auth/avatar', authMiddleware, (req, res) => {
-  db.query('UPDATE users SET avatar_url = NULL WHERE id = ?', [req.user.id], (err, result) => {
-    if (err) {
-      console.error('Database error:', err);
-      return res.status(500).json({ success: false, message: 'Database error' });
-    }
-    res.json({ success: true, message: 'Avatar removed successfully' });
-  });
-});
-
-// UPDATE: Enhanced profile update endpoint (handles both users and job_seekers)
-app.put('/api/auth/profile', authMiddleware, (req, res) => {
-  const { first_name, last_name, phone, location, headline } = req.body;
-  
-  // Update users table
-  const userUpdates = [];
-  const userValues = [];
-  
-  if (first_name !== undefined) {
-    userUpdates.push('first_name = ?');
-    userValues.push(first_name);
-  }
-  if (last_name !== undefined) {
-    userUpdates.push('last_name = ?');
-    userValues.push(last_name);
-  }
-  if (phone !== undefined) {
-    userUpdates.push('phone = ?');
-    userValues.push(phone);
-  }
-  
-  if (userUpdates.length > 0) {
-    userUpdates.push('updated_at = NOW()');
-    userValues.push(req.user.id);
-    
-    db.query(
-      `UPDATE users SET ${userUpdates.join(', ')} WHERE id = ?`,
-      userValues,
-      (err, result) => {
-        if (err) {
-          console.error('Database error:', err);
-          return res.status(500).json({ success: false, message: 'Database error' });
-        }
-      }
-    );
-  }
-  
-  // Update job_seekers table if location or headline provided
-  if (location !== undefined || headline !== undefined) {
-    const seekerUpdates = [];
-    const seekerValues = [];
-    
-    if (location !== undefined) {
-      seekerUpdates.push('location = ?');
-      seekerValues.push(location);
-    }
-    if (headline !== undefined) {
-      seekerUpdates.push('headline = ?');
-      seekerValues.push(headline);
-    }
-    
-    if (seekerUpdates.length > 0) {
-      seekerUpdates.push('updated_at = NOW()');
-      seekerValues.push(req.user.id);
-      
-      db.query(
-        `UPDATE job_seekers SET ${seekerUpdates.join(', ')} WHERE user_id = ?`,
-        seekerValues,
-        (err, result) => {
-          if (err) {
-            console.error('Database error:', err);
-            return res.status(500).json({ success: false, message: 'Database error' });
-          }
-        }
-      );
-    }
-  }
-  
-  res.json({ success: true, message: 'Profile updated successfully' });
-});
-
-// Delete notification
-app.delete('/api/notifications/:id', authMiddleware, (req, res) => {
-  db.query('DELETE FROM notifications WHERE id = ? AND user_id = ?', [req.params.id, req.user.id], (err, result) => {
-    if (err) {
-      console.error('Delete notification error:', err);
-      return res.status(500).json({ success: false, message: 'Database error' });
-    }
-    res.json({ success: true, message: 'Notification deleted' });
-  });
-});
-
-// Get unread count
-app.get('/api/notifications/unread-count', authMiddleware, (req, res) => {
-  db.query('SELECT COUNT(*) as count FROM notifications WHERE user_id = ? AND is_read = false', [req.user.id], (err, results) => {
-    if (err) {
-      console.error('Unread count error:', err);
-      return res.status(500).json({ success: false, message: 'Database error' });
-    }
-    res.json({ success: true, data: { unread: results[0].count } });
-  });
-});
-
-// ==================== JOB ALERTS ====================
-app.post('/api/job-alerts', authMiddleware, (req, res) => {
-  if (req.user.user_type !== 'job_seeker') {
-    return res.status(403).json({ success: false, message: 'Only job seekers can create alerts' });
-  }
-  res.json({ success: true, message: 'Job alert created (feature coming soon)' });
-});
-
-app.get('/api/job-alerts', authMiddleware, (req, res) => {
-  res.json({ success: true, data: [] });
-});
-
-// ==================== COMPANY REVIEWS ====================
-app.post('/api/companies/:companyId/reviews', authMiddleware, (req, res) => {
-  if (req.user.user_type !== 'job_seeker') {
-    return res.status(403).json({ success: false, message: 'Only job seekers can review companies' });
-  }
-  res.json({ success: true, message: 'Review added (feature coming soon)' });
-});
-
-app.get('/api/companies/:companyId/reviews', (req, res) => {
-  res.json({ success: true, data: [] });
-});
-
 // ==================== STATISTICS ====================
 app.get('/api/stats', (req, res) => {
   const stats = {};
-
   db.query('SELECT COUNT(*) as total FROM jobs WHERE is_active = true', (err, result) => {
     stats.totalJobs = result[0].total;
-    
     db.query('SELECT COUNT(*) as total FROM employers WHERE verified = true', (err, result) => {
       stats.totalCompanies = result[0].total;
-      
       db.query('SELECT COUNT(*) as total FROM job_seekers', (err, result) => {
         stats.totalJobSeekers = result[0].total;
-        
         db.query('SELECT COUNT(*) as total FROM applications', (err, result) => {
           stats.totalApplications = result[0].total;
           res.json({ success: true, data: stats });
@@ -1332,287 +991,56 @@ app.get('/api/stats', (req, res) => {
   });
 });
 
-// Get employer dashboard stats
-app.get('/api/employer/stats', authMiddleware, (req, res) => {
-  if (req.user.user_type !== 'employer') {
-    return res.status(403).json({ success: false, message: 'Access denied' });
-  }
-
-  db.query(
-    `SELECT 
-      (SELECT COUNT(*) FROM jobs WHERE employer_id = e.id AND is_active = true) as active_jobs,
-      (SELECT COUNT(*) FROM jobs WHERE employer_id = e.id) as total_jobs,
-      (SELECT COUNT(*) FROM applications a JOIN jobs j ON a.job_id = j.id WHERE j.employer_id = e.id) as total_applications,
-      (SELECT COUNT(*) FROM applications a JOIN jobs j ON a.job_id = j.id WHERE j.employer_id = e.id AND a.status = 'pending') as pending_applications
-     FROM employers e
-     WHERE e.user_id = ?`,
-    [req.user.id],
-    (err, results) => {
-      if (err) {
-        console.error('Stats error:', err);
-        return res.status(500).json({ success: false, message: 'Database error' });
-      }
-      res.json({ success: true, data: results[0] });
-    }
-  );
-});
-
-// ==================== PAYMENT ROUTES ====================
-
-// Initialize payment
-app.post('/api/payments/initiate', authMiddleware, (req, res) => {
-  const { plan, amount, paymentMethod, paymentDetails } = req.body;
-  
-  console.log('💰 Payment initiated:', { plan, amount, paymentMethod, userId: req.user.id });
-  
-  if (paymentMethod === 'momo') {
-    const momoNumber = paymentDetails?.momoNumber;
-    console.log(`📱 Sending payment request to ${momoNumber} for GHS ${amount}`);
-    
-    setTimeout(() => {
-      activateSubscription(req.user.id, plan);
-    }, 10000);
-    
-    res.json({
-      success: true,
-      message: `Payment request sent to ${momoNumber}. Please check your phone and approve the payment.`,
-      data: { payment_id: 'sim_' + Date.now() }
-    });
-  } 
-  else if (paymentMethod === 'bank') {
-    const bankDetails = {
-      bank_name: "GCB Bank",
-      account_name: "CareerLinkGH",
-      account_number: "1234567890",
-      branch: "Takoradi Main",
-      amount: `GHS ${amount}`,
-      reference: 'REF_' + Date.now(),
-      phone: "0545784013",
-      instructions: [
-        "Go to any GCB Bank branch or use mobile banking",
-        "Transfer the exact amount to the account above",
-        "Use the Payment ID as reference",
-        "Send payment screenshot to 0545784013 via WhatsApp"
-      ]
-    };
-    
-    res.json({
-      success: true,
-      message: 'Bank transfer instructions generated',
-      data: { payment_id: 'bank_' + Date.now(), bank_details: bankDetails }
-    });
-  }
-  else {
-    res.status(400).json({ success: false, message: 'Invalid payment method' });
-  }
-});
-
-// Helper function to activate subscription
-function activateSubscription(userId, planName) {
-  let jobPostsRemaining = 0;
-  let subscriptionDays = 0;
-  
-  switch(planName) {
-    case 'Basic':
-      jobPostsRemaining = 5;
-      subscriptionDays = 30;
-      break;
-    case 'Professional':
-      jobPostsRemaining = 20;
-      subscriptionDays = 30;
-      break;
-    case 'Enterprise':
-      jobPostsRemaining = 999;
-      subscriptionDays = 90;
-      break;
-    default:
-      jobPostsRemaining = 1;
-      subscriptionDays = 30;
-  }
-  
-  db.query(
-    `UPDATE users 
-     SET subscription_plan = ?, 
-         subscription_expires = DATE_ADD(NOW(), INTERVAL ? DAY),
-         job_posts_remaining = ?
-     WHERE id = ?`,
-    [planName, subscriptionDays, jobPostsRemaining, userId],
-    (err) => {
-      if (err) {
-        console.error('Subscription update error:', err);
-      } else {
-        console.log(`✅ Subscription activated for user ${userId}: ${planName} plan`);
-        db.query(`UPDATE employers SET subscription_tier = ? WHERE user_id = ?`, [planName.toLowerCase(), userId]);
-      }
-    }
-  );
-}
-
-// Get payment status
-app.get('/api/payments/:paymentId/status', authMiddleware, (req, res) => {
-  res.json({ success: true, data: { status: 'completed', message: 'Payment completed successfully' } });
-});
-
-// Get subscription status
-app.get('/api/subscription/status', authMiddleware, (req, res) => {
-  db.query(
-    `SELECT subscription_plan, subscription_expires, job_posts_remaining,
-            DATEDIFF(subscription_expires, NOW()) as days_remaining
-     FROM users WHERE id = ?`,
-    [req.user.id],
-    (err, results) => {
-      if (err) {
-        return res.status(500).json({ success: false, message: 'Database error' });
-      }
-      
-      const subscription = results[0];
-      const isActive = subscription.subscription_expires && 
-                       new Date(subscription.subscription_expires) > new Date();
-      
-      res.json({
-        success: true,
-        data: {
-          ...subscription,
-          is_active: isActive,
-          can_post_jobs: subscription.job_posts_remaining > 0 && isActive
-        }
-      });
-    }
-  );
-});
-
-// ==================== COMPANIES (EMPLOYERS) ENDPOINTS ====================
-
-// Get all companies (employers) - Public endpoint
+// ==================== COMPANIES ENDPOINTS ====================
 app.get('/api/employers', (req, res) => {
-  let query = `
-    SELECT e.id, e.company_name, e.company_logo, e.company_description, 
-           e.industry, e.city as location, e.verified,
-           e.total_jobs_posted, e.active_jobs,
-           COUNT(DISTINCT j.id) as total_jobs
-    FROM employers e
-    LEFT JOIN jobs j ON j.employer_id = e.id AND j.is_active = true
-    GROUP BY e.id
-    ORDER BY e.total_jobs_posted DESC
-    LIMIT 50
-  `;
-  
-  db.query(query, (err, results) => {
+  db.query(`
+    SELECT e.id, e.company_name, e.company_logo, e.company_description, e.industry, e.city as location, e.verified, e.total_jobs_posted, e.active_jobs, COUNT(DISTINCT j.id) as total_jobs
+    FROM employers e LEFT JOIN jobs j ON j.employer_id = e.id AND j.is_active = true GROUP BY e.id ORDER BY e.total_jobs_posted DESC LIMIT 50
+  `, (err, results) => {
     if (err) {
       console.error('Database error:', err);
       return res.status(500).json({ success: false, message: 'Database error' });
     }
-    
-    const companies = results.map(company => ({
-      id: company.id,
-      company_name: company.company_name,
-      company_logo: company.company_logo,
-      company_description: company.company_description,
-      industry: company.industry || 'General',
-      location: company.location || 'Ghana',
-      verified: company.verified === 1,
-      total_jobs_posted: company.total_jobs_posted || 0,
-      active_jobs: company.active_jobs || 0,
-      total_jobs: company.total_jobs || 0
-    }));
-    
-    res.json({ success: true, data: companies });
+    res.json({ success: true, data: results });
   });
 });
 
-// Get single company details
 app.get('/api/employers/:id', (req, res) => {
-  db.query(
-    `SELECT e.*, 
-            COUNT(DISTINCT j.id) as total_jobs
-     FROM employers e
-     LEFT JOIN jobs j ON j.employer_id = e.id AND j.is_active = true
-     WHERE e.id = ?
-     GROUP BY e.id`,
-    [req.params.id],
-    (err, results) => {
-      if (err) {
-        console.error('Database error:', err);
-        return res.status(500).json({ success: false, message: 'Database error' });
-      }
-      
-      if (results.length === 0) {
-        return res.status(404).json({ success: false, message: 'Company not found' });
-      }
-      
-      res.json({ success: true, data: results[0] });
+  db.query(`SELECT e.*, COUNT(DISTINCT j.id) as total_jobs FROM employers e LEFT JOIN jobs j ON j.employer_id = e.id AND j.is_active = true WHERE e.id = ? GROUP BY e.id`, [req.params.id], (err, results) => {
+    if (err) {
+      console.error('Database error:', err);
+      return res.status(500).json({ success: false, message: 'Database error' });
     }
-  );
+    if (results.length === 0) {
+      return res.status(404).json({ success: false, message: 'Company not found' });
+    }
+    res.json({ success: true, data: results[0] });
+  });
 });
 
-// Get jobs for a specific company
 app.get('/api/employers/:id/jobs', (req, res) => {
-  db.query(
-    `SELECT j.*, c.name as category_name
-     FROM jobs j
-     LEFT JOIN job_categories c ON j.category_id = c.id
-     WHERE j.employer_id = ? AND j.is_active = true
-     ORDER BY j.created_at DESC`,
-    [req.params.id],
-    (err, results) => {
-      if (err) {
-        console.error('Database error:', err);
-        return res.status(500).json({ success: false, message: 'Database error' });
-      }
-      res.json({ success: true, data: results });
+  db.query(`SELECT j.*, c.name as category_name FROM jobs j LEFT JOIN job_categories c ON j.category_id = c.id WHERE j.employer_id = ? AND j.is_active = true ORDER BY j.created_at DESC`, [req.params.id], (err, results) => {
+    if (err) {
+      console.error('Database error:', err);
+      return res.status(500).json({ success: false, message: 'Database error' });
     }
-  );
+    res.json({ success: true, data: results });
+  });
 });
 
 // ==================== TEST ENDPOINTS ====================
 app.get('/', (req, res) => {
-  res.json({
-    success: true,
-    message: '🎉 CareerLinkGH API is running!',
-    developer: 'Justice Quarshie',
-    location: 'Takoradi, Ghana',
-    version: '1.0.0',
-    timestamp: new Date().toISOString()
-  });
+  res.json({ success: true, message: '🎉 CareerLinkGH API is running!', developer: 'Justice Quarshie', location: 'Takoradi, Ghana', version: '1.0.0', timestamp: new Date().toISOString() });
 });
 
-// Health check
 app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    uptime: process.uptime(),
-    database: db.state,
-    timestamp: new Date().toISOString()
-  });
+  res.json({ status: 'healthy', uptime: process.uptime(), database: db.state, timestamp: new Date().toISOString() });
 });
 
-// 404 handler
 app.use('*', (req, res) => {
-  res.status(404).json({
-    success: false,
-    message: 'Endpoint not found',
-    path: req.originalUrl
-  });
+  res.status(404).json({ success: false, message: 'Endpoint not found', path: req.originalUrl });
 });
 
-// Start server
 app.listen(PORT, () => {
-  console.log(`
-  ╔═══════════════════════════════════════════════════════════╗
-  ║                                                           ║
-  ║   🚀 CareerLinkGH Server Started Successfully!           ║
-  ║                                                           ║
-  ╠═══════════════════════════════════════════════════════════╣
-  ║                                                           ║
-  ║   📍 Port: ${PORT}                                        ║
-  ║   🌐 URL: http://localhost:${PORT}                       ║
-  ║                                                           ║
-  ╠═══════════════════════════════════════════════════════════╣
-  ║                                                           ║
-  ║   👨‍💻 Developer: Justice Quarshie                        ║
-  ║   🏢 Project: CareerLinkGH                               ║
-  ║   📍 Location: Takoradi, Ghana                           ║
-  ║                                                           ║
-  ╚═══════════════════════════════════════════════════════════╝
-  `);
+  console.log(`\n  ╔═══════════════════════════════════════════════════════════╗\n  ║                                                           ║\n  ║   🚀 CareerLinkGH Server Started Successfully!           ║\n  ║                                                           ║\n  ╠═══════════════════════════════════════════════════════════╣\n  ║                                                           ║\n  ║   📍 Port: ${PORT}                                        ║\n  ║   🌐 URL: http://localhost:${PORT}                       ║\n  ║                                                           ║\n  ╠═══════════════════════════════════════════════════════════╣\n  ║                                                           ║\n  ║   👨‍💻 Developer: Justice Quarshie                        ║\n  ║   🏢 Project: CareerLinkGH                               ║\n  ║   📍 Location: Takoradi, Ghana                           ║\n  ║                                                           ║\n  ╚═══════════════════════════════════════════════════════════╝\n  `);
 });
