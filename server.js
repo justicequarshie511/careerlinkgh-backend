@@ -62,7 +62,7 @@ db.connect(err => {
   } else {
     console.log('✅ Database connected successfully');
     
-    // Create notifications table after DB connection
+    // Create notifications table after DB is connected
     const createNotificationsTable = `
       CREATE TABLE IF NOT EXISTS notifications (
         id VARCHAR(36) PRIMARY KEY,
@@ -131,6 +131,10 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password, first_name, last_name, phone, user_type, company_name } = req.body;
     
+    console.log('📝 Register attempt for:', email);
+    console.log('📝 User type:', user_type);
+    console.log('📝 Company name received:', company_name);
+
     db.query('SELECT * FROM users WHERE email = ?', [email], async (err, results) => {
       if (err) {
         console.error('Database error:', err);
@@ -157,7 +161,11 @@ app.post('/api/auth/register', async (req, res) => {
           if (user_type === 'employer') {
             const employerId = uuidv4();
             const companyName = company_name || `${first_name}'s Company`;
-            db.query('INSERT INTO employers (id, user_id, company_name) VALUES (?, ?, ?)', [employerId, userId, companyName]);
+            console.log('📝 Creating employer with company name:', companyName);
+            db.query(
+              'INSERT INTO employers (id, user_id, company_name) VALUES (?, ?, ?)',
+              [employerId, userId, companyName]
+            );
           } else if (user_type === 'job_seeker') {
             const seekerId = uuidv4();
             db.query('INSERT INTO job_seekers (id, user_id) VALUES (?, ?)', [seekerId, userId]);
@@ -190,6 +198,8 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', (req, res) => {
   const { email, password } = req.body;
   
+  console.log('🔑 Login attempt for:', email);
+
   db.query('SELECT * FROM users WHERE email = ?', [email], async (err, results) => {
     if (err) {
       console.error('Database error:', err);
@@ -491,7 +501,7 @@ app.post('/api/jobs/:jobId/apply', authMiddleware, (req, res) => {
   });
 });
 
-// Update application status (employer only) - WITH FIXED NOTIFICATIONS
+// Update application status (employer only) - WITH NOTIFICATIONS
 app.put('/api/applications/:id/status', authMiddleware, (req, res) => {
   if (req.user.user_type !== 'employer') {
     return res.status(403).json({ success: false, message: 'Access denied' });
@@ -500,7 +510,7 @@ app.put('/api/applications/:id/status', authMiddleware, (req, res) => {
   const { status, interview_date, interview_notes } = req.body;
 
   db.query(
-    `SELECT a.id, a.job_id, a.job_seeker_id, j.title, j.employer_id 
+    `SELECT a.id, a.job_id, a.job_seeker_id, j.title 
      FROM applications a
      LEFT JOIN jobs j ON a.job_id = j.id
      LEFT JOIN employers e ON j.employer_id = e.id
@@ -759,7 +769,6 @@ app.get('/api/notifications', authMiddleware, (req, res) => {
           if (err) {
             return res.json({ success: true, data: results, unread: 0 });
           }
-          
           res.json({ success: true, data: results, unread: countResult[0].unread });
         }
       );
@@ -1028,6 +1037,19 @@ app.get('/api/employers/:id/jobs', (req, res) => {
   });
 });
 
+// ==================== PAYMENT ROUTES (Simplified) ====================
+app.post('/api/payments/initiate', authMiddleware, (req, res) => {
+  res.json({ success: true, message: 'Payment initiated', data: { payment_id: 'pay_' + Date.now() } });
+});
+
+app.get('/api/payments/:paymentId/status', authMiddleware, (req, res) => {
+  res.json({ success: true, data: { status: 'completed' } });
+});
+
+app.get('/api/subscription/status', authMiddleware, (req, res) => {
+  res.json({ success: true, data: { plan: 'free', is_active: true, can_post_jobs: true } });
+});
+
 // ==================== TEST ENDPOINTS ====================
 app.get('/', (req, res) => {
   res.json({ success: true, message: '🎉 CareerLinkGH API is running!', developer: 'Justice Quarshie', location: 'Takoradi, Ghana', version: '1.0.0', timestamp: new Date().toISOString() });
@@ -1042,5 +1064,21 @@ app.use('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`\n  ╔═══════════════════════════════════════════════════════════╗\n  ║                                                           ║\n  ║   🚀 CareerLinkGH Server Started Successfully!           ║\n  ║                                                           ║\n  ╠═══════════════════════════════════════════════════════════╣\n  ║                                                           ║\n  ║   📍 Port: ${PORT}                                        ║\n  ║   🌐 URL: http://localhost:${PORT}                       ║\n  ║                                                           ║\n  ╠═══════════════════════════════════════════════════════════╣\n  ║                                                           ║\n  ║   👨‍💻 Developer: Justice Quarshie                        ║\n  ║   🏢 Project: CareerLinkGH                               ║\n  ║   📍 Location: Takoradi, Ghana                           ║\n  ║                                                           ║\n  ╚═══════════════════════════════════════════════════════════╝\n  `);
+  console.log(`\n  ╔═══════════════════════════════════════════════════════════╗
+  ║                                                           ║
+  ║   🚀 CareerLinkGH Server Started Successfully!           ║
+  ║                                                           ║
+  ╠═══════════════════════════════════════════════════════════╣
+  ║                                                           ║
+  ║   📍 Port: ${PORT}                                        ║
+  ║   🌐 URL: http://localhost:${PORT}                       ║
+  ║                                                           ║
+  ╠═══════════════════════════════════════════════════════════╣
+  ║                                                           ║
+  ║   👨‍💻 Developer: Justice Quarshie                        ║
+  ║   🏢 Project: CareerLinkGH                               ║
+  ║   📍 Location: Takoradi, Ghana                           ║
+  ║                                                           ║
+  ╚═══════════════════════════════════════════════════════════╝
+  `);
 });
