@@ -977,7 +977,7 @@ app.get('/api/notifications', authMiddleware, (req, res) => {
 });
 
 // Configure Cloudinary storage for persistent file uploads
-const cloudinary = require('cloudinary').v2;
+const cloudinary = require('cloudinary');
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
 // Configure Cloudinary
