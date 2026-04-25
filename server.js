@@ -15,8 +15,14 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 
 // Helper function to generate correct file URLs
-const getFileUrl = (req, filename) => {
+const getFileUrl = (req, file) => {
+  // If using Cloudinary, the file has a path property with the URL
+  if (file && file.path) {
+    return file.path;
+  }
+  // Fallback to local storage
   const host = req.get('host');
+  const filename = typeof file === 'string' ? file : file.filename;
   if (req.get('x-forwarded-proto') === 'https' || process.env.NODE_ENV === 'production') {
     return `https://${host}/uploads/${filename}`;
   }
@@ -113,6 +119,14 @@ const authMiddleware = (req, res, next) => {
       message: 'Please authenticate' 
     });
   }
+};
+
+// ==================== ADMIN MIDDLEWARE ====================
+const adminMiddleware = (req, res, next) => {
+  if (req.user.user_type !== 'admin') {
+    return res.status(403).json({ success: false, message: 'Access denied. Admin only.' });
+  }
+  next();
 };
 
 // ==================== AUTH ROUTES ====================
@@ -272,18 +286,27 @@ app.get('/api/categories', (req, res) => {
 
 // ==================== JOBS CRUD ====================
 
-// Create job (employer only) - UPDATES employer counts
+// Create job (employer only) - UPDATES employer counts WITH VERIFICATION CHECK
 app.post('/api/jobs', authMiddleware, (req, res) => {
   if (req.user.user_type !== 'employer') {
     return res.status(403).json({ success: false, message: 'Only employers can post jobs' });
   }
 
-  db.query('SELECT id FROM employers WHERE user_id = ?', [req.user.id], (err, employerResults) => {
+  db.query('SELECT id, verified FROM employers WHERE user_id = ?', [req.user.id], (err, employerResults) => {
     if (err || employerResults.length === 0) {
       return res.status(400).json({ success: false, message: 'Employer profile not found' });
     }
 
-    const employer_id = employerResults[0].id;
+    // VERIFICATION CHECK - Only verified employers can post jobs
+    const employer = employerResults[0];
+    if (employer.verified !== 1) {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Your company must be verified before you can post jobs. Please upload your business registration document in your profile.' 
+      });
+    }
+
+    const employer_id = employer.id;
     const jobId = uuidv4();
     const {
       title, description, requirements, benefits, job_type,
@@ -953,18 +976,24 @@ app.get('/api/notifications', authMiddleware, (req, res) => {
   );
 });
 
-// Configure storage for file uploads (LOCAL ONLY - NO CLOUDINARY)
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    const uploadDir = 'uploads/';
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
+// Configure Cloudinary storage for persistent file uploads
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
+
+// Configure Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+// Cloudinary storage configuration
+const storage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: 'careerlinkgh',
+    allowed_formats: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'pdf'],
+    transformation: [{ width: 500, height: 500, crop: 'limit' }]
   }
 });
 
@@ -982,7 +1011,7 @@ const upload = multer({
   limits: { fileSize: 5 * 1024 * 1024 }
 });
 
-// Serve uploaded files statically
+// Serve uploaded files statically (for backward compatibility)
 app.use('/uploads', express.static('uploads'));
 
 // ==================== FILE UPLOAD ROUTES ====================
@@ -993,7 +1022,7 @@ app.post('/api/upload/profile-picture', authMiddleware, upload.single('image'), 
     return res.status(400).json({ success: false, message: 'No file uploaded' });
   }
 
-  const fileUrl = getFileUrl(req, req.file.filename);
+  const fileUrl = getFileUrl(req, req.file);
   
   db.query('UPDATE users SET avatar_url = ? WHERE id = ?', [fileUrl, req.user.id], (err, result) => {
     if (err) {
@@ -1002,6 +1031,125 @@ app.post('/api/upload/profile-picture', authMiddleware, upload.single('image'), 
     }
     res.json({ success: true, message: 'Profile picture uploaded successfully', data: { url: fileUrl } });
   });
+});
+
+// ==================== EMPLOYER VERIFICATION ENDPOINTS ====================
+
+// Upload verification document (employer only)
+app.post('/api/employer/upload-verification', authMiddleware, upload.single('document'), (req, res) => {
+  if (req.user.user_type !== 'employer') {
+    return res.status(403).json({ success: false, message: 'Access denied' });
+  }
+
+  if (!req.file) {
+    return res.status(400).json({ success: false, message: 'No file uploaded' });
+  }
+
+  // Check file type (only PDF and images allowed)
+  const allowedTypes = ['application/pdf', 'image/jpeg', 'image/png', 'image/jpg'];
+  if (!allowedTypes.includes(req.file.mimetype)) {
+    return res.status(400).json({ success: false, message: 'Only PDF, JPEG, and PNG files are allowed' });
+  }
+
+  // Check file size (max 5MB)
+  if (req.file.size > 5 * 1024 * 1024) {
+    return res.status(400).json({ success: false, message: 'File size must be less than 5MB' });
+  }
+
+  const fileUrl = getFileUrl(req, req.file);
+  const { business_registration_number } = req.body;
+
+  db.query(
+    `UPDATE employers SET 
+      verification_document = ?,
+      business_registration_number = ?,
+      verification_requested_at = NOW(),
+      verified = 0
+     WHERE user_id = ?`,
+    [fileUrl, business_registration_number || null, req.user.id],
+    (err, result) => {
+      if (err) {
+        console.error('Upload verification error:', err);
+        return res.status(500).json({ success: false, message: 'Database error' });
+      }
+
+      // Notify admin that verification is requested
+      db.query('SELECT id FROM users WHERE user_type = "admin" LIMIT 1', (err, adminResults) => {
+        if (adminResults && adminResults.length > 0) {
+          createNotification(
+            adminResults[0].id,
+            'system',
+            'Company Verification Request',
+            `A new company has requested verification. Please review the documents.`,
+            req.user.id
+          );
+        }
+      });
+
+      res.json({ 
+        success: true, 
+        message: 'Verification document uploaded successfully. Your account will be reviewed by an admin.',
+        data: { document_url: fileUrl }
+      });
+    }
+  );
+});
+
+// Check verification status (employer only)
+app.get('/api/employer/verification-status', authMiddleware, (req, res) => {
+  if (req.user.user_type !== 'employer') {
+    return res.status(403).json({ success: false, message: 'Access denied' });
+  }
+
+  db.query(
+    `SELECT verified, verification_document, business_registration_number, 
+            verification_requested_at, verification_notes, verified_at
+     FROM employers WHERE user_id = ?`,
+    [req.user.id],
+    (err, results) => {
+      if (err) {
+        console.error('Verification status error:', err);
+        return res.status(500).json({ success: false, message: 'Database error' });
+      }
+
+      const status = results[0] || { verified: 0 };
+      let message = '';
+      
+      if (status.verified === 1) {
+        message = 'Your company is verified. You can now post jobs.';
+      } else if (status.verification_requested_at) {
+        message = 'Your verification documents are being reviewed. You will be notified once approved.';
+      } else {
+        message = 'Please upload your business registration document to get verified.';
+      }
+
+      res.json({ 
+        success: true, 
+        data: status,
+        message: message
+      });
+    }
+  );
+});
+
+// Get pending verifications (admin only)
+app.get('/api/admin/pending-verifications', authMiddleware, adminMiddleware, (req, res) => {
+  db.query(
+    `SELECT e.id, e.company_name, e.company_logo, e.verification_document, 
+            e.business_registration_number, e.verification_requested_at,
+            u.id as user_id, u.email, u.first_name, u.last_name, u.created_at
+     FROM employers e
+     LEFT JOIN users u ON e.user_id = u.id
+     WHERE e.verified = 0 AND e.verification_document IS NOT NULL
+     ORDER BY e.verification_requested_at ASC`,
+    (err, results) => {
+      if (err) {
+        console.error('Pending verifications error:', err);
+        return res.status(500).json({ success: false, message: 'Database error' });
+      }
+      res.json({ success: true, data: results });
+    }
+  );
 });
 
 // ==================== UPDATED SEEKER PROFILE ENDPOINTS (FOR RESUME BUILDER) ====================
@@ -1152,7 +1300,7 @@ app.post('/api/upload/resume', authMiddleware, upload.single('resume'), (req, re
     return res.status(400).json({ success: false, message: 'No file uploaded' });
   }
 
-  const fileUrl = getFileUrl(req, req.file.filename);
+  const fileUrl = getFileUrl(req, req.file);
   
   db.query(
     'UPDATE job_seekers SET resume_url = ? WHERE user_id = ?',
@@ -1177,7 +1325,7 @@ app.post('/api/upload/company-logo', authMiddleware, upload.single('logo'), (req
     return res.status(400).json({ success: false, message: 'No file uploaded' });
   }
 
-  const fileUrl = getFileUrl(req, req.file.filename);
+  const fileUrl = getFileUrl(req, req.file);
   
   db.query('UPDATE employers SET company_logo = ? WHERE user_id = ?', [fileUrl, req.user.id], (err, result) => {
     if (err) {
@@ -1226,7 +1374,7 @@ app.post('/api/auth/avatar', authMiddleware, upload.single('avatar'), (req, res)
     return res.status(400).json({ success: false, message: 'File size must be less than 2MB' });
   }
 
-  const fileUrl = getFileUrl(req, req.file.filename);
+  const fileUrl = getFileUrl(req, req.file);
   
   db.query('UPDATE users SET avatar_url = ? WHERE id = ?', [fileUrl, req.user.id], (err, result) => {
     if (err) {
@@ -1640,15 +1788,8 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString()
   });
 });
-// ==================== ADMIN ROUTES ====================
 
-// Admin middleware (check if user is admin)
-const adminMiddleware = (req, res, next) => {
-  if (req.user.user_type !== 'admin') {
-    return res.status(403).json({ success: false, message: 'Access denied. Admin only.' });
-  }
-  next();
-};
+// ==================== ADMIN ROUTES ====================
 
 // Get all users (admin only)
 app.get('/api/admin/users', authMiddleware, adminMiddleware, (req, res) => {
@@ -1721,38 +1862,55 @@ app.get('/api/admin/jobs', authMiddleware, adminMiddleware, (req, res) => {
   );
 });
 
-// Verify a company (admin only)
+// Verify a company (admin only) - ENHANCED with notes
 app.put('/api/admin/verify-company/:id', authMiddleware, adminMiddleware, (req, res) => {
-  const { verified } = req.body;
+  const { verified, notes } = req.body;
   
   db.query(
-    'UPDATE employers SET verified = ? WHERE id = ?',
-    [verified ? 1 : 0, req.params.id],
+    `UPDATE employers SET 
+      verified = ?, 
+      verification_notes = ?,
+      verified_by = ?,
+      verified_at = NOW()
+     WHERE id = ?`,
+    [verified ? 1 : 0, notes || null, req.user.id, req.params.id],
     (err, result) => {
       if (err) {
         console.error('Verify company error:', err);
         return res.status(500).json({ success: false, message: 'Database error' });
       }
       
-      // Get company email to notify employer
+      // Get employer user_id and company name
       db.query(
-        'SELECT u.email, e.company_name FROM employers e LEFT JOIN users u ON e.user_id = u.id WHERE e.id = ?',
+        'SELECT e.user_id, e.company_name FROM employers e WHERE e.id = ?',
         [req.params.id],
         (err, companyResults) => {
           if (companyResults && companyResults.length > 0) {
-            const statusText = verified ? 'verified' : 'unverified';
-            createNotification(
-              companyResults[0].user_id,
-              'system',
-              verified ? 'Company Verified ✓' : 'Company Status Updated',
-              `Your company "${companyResults[0].company_name}" has been ${statusText}.`,
-              req.params.id
-            );
+            const employerUserId = companyResults[0].user_id;
+            const companyName = companyResults[0].company_name;
+            
+            if (verified) {
+              createNotification(
+                employerUserId,
+                'system',
+                '✅ Company Verified!',
+                `Your company "${companyName}" has been verified. You can now post jobs on CareerLinkGH.`,
+                req.params.id
+              );
+            } else {
+              createNotification(
+                employerUserId,
+                'system',
+                'Company Verification Update',
+                `Your company "${companyName}" verification request has been reviewed. ${notes || 'Please contact support for more information.'}`,
+                req.params.id
+              );
+            }
           }
         }
       );
       
-      res.json({ success: true, message: `Company ${verified ? 'verified' : 'unverified'} successfully` });
+      res.json({ success: true, message: `Company ${verified ? 'verified' : 'rejected'} successfully` });
     }
   );
 });
@@ -1802,6 +1960,7 @@ app.get('/api/admin/stats', authMiddleware, adminMiddleware, (req, res) => {
     });
   }
 });
+
 // Activate user (admin only)
 app.put('/api/admin/users/:id/activate', authMiddleware, adminMiddleware, (req, res) => {
   db.query('UPDATE users SET is_active = 1 WHERE id = ?', [req.params.id], (err, result) => {
@@ -1846,6 +2005,7 @@ app.put('/api/admin/users/:id/deactivate', authMiddleware, adminMiddleware, (req
     res.json({ success: true, message: 'User deactivated successfully' });
   });
 });
+
 // ==================== ADMIN SETTINGS ENDPOINTS ====================
 
 // Get platform settings
