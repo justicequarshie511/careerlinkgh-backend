@@ -20,13 +20,15 @@ const getFileUrl = (req, file) => {
   if (file && file.path) {
     return file.path;
   }
-  // Fallback to local storage
-  const host = req.get('host');
+
   const filename = typeof file === 'string' ? file : file.filename;
-  if (req.get('x-forwarded-proto') === 'https' || process.env.NODE_ENV === 'production') {
-    return `https://${host}/uploads/${filename}`;
+  const baseUrl = process.env.BACKEND_URL || (req.get('x-forwarded-proto') === 'https' ? `https://${req.get('host')}` : `${req.protocol}://${req.get('host')}`);
+
+  if (!baseUrl) {
+    return `/uploads/${filename}`;
   }
-  return `${req.protocol}://${host}/uploads/${filename}`;
+
+  return `${baseUrl.replace(/\/$/, '')}/uploads/${filename}`;
 };
 
 // Ensure uploads directory exists
