@@ -976,24 +976,14 @@ app.get('/api/notifications', authMiddleware, (req, res) => {
   );
 });
 
-// Configure Cloudinary storage for persistent file uploads
-const cloudinary = require('cloudinary');
-const { CloudinaryStorage } = require('multer-storage-cloudinary');
-
-// Configure Cloudinary
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET
-});
-
-// Cloudinary storage configuration
-const storage = new CloudinaryStorage({
-  cloudinary: cloudinary,
-  params: {
-    folder: 'careerlinkgh',
-    allowed_formats: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'pdf'],
-    transformation: [{ width: 500, height: 500, crop: 'limit' }]
+// Local disk storage configuration for file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    cb(null, `${uuidv4()}${ext}`);
   }
 });
 
@@ -1005,9 +995,9 @@ const fileFilter = (req, file, cb) => {
   }
 };
 
-const upload = multer({ 
-  storage: storage,
-  fileFilter: fileFilter,
+const upload = multer({
+  storage,
+  fileFilter,
   limits: { fileSize: 5 * 1024 * 1024 }
 });
 
