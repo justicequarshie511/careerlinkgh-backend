@@ -1920,13 +1920,13 @@ app.delete('/api/admin/users/:id', authMiddleware, adminMiddleware, (req, res) =
 app.get('/api/admin/stats', authMiddleware, adminMiddleware, (req, res) => {
   const queries = {
     totalUsers: 'SELECT COUNT(*) as count FROM users',
-    totalEmployers: 'SELECT COUNT(*) as count FROM users WHERE user_type = "employer"',
-    totalJobSeekers: 'SELECT COUNT(*) as count FROM users WHERE user_type = "job_seeker"',
+    totalEmployers: "SELECT COUNT(*) as count FROM users WHERE user_type = 'employer'",
+    totalJobSeekers: "SELECT COUNT(*) as count FROM users WHERE user_type = 'job_seeker'",
     totalJobs: 'SELECT COUNT(*) as count FROM jobs',
-    activeJobs: 'SELECT COUNT(*) as count FROM jobs WHERE is_active = true',
+    activeJobs: 'SELECT COUNT(*) as count FROM jobs WHERE is_active = 1',
     totalApplications: 'SELECT COUNT(*) as count FROM applications',
-    pendingApplications: 'SELECT COUNT(*) as count FROM applications WHERE status = "pending"',
-    verifiedCompanies: 'SELECT COUNT(*) as count FROM employers WHERE verified = true',
+    pendingApplications: "SELECT COUNT(*) as count FROM applications WHERE status = 'pending'",
+    verifiedCompanies: 'SELECT COUNT(*) as count FROM employers WHERE verified = 1',
     totalNotifications: 'SELECT COUNT(*) as count FROM notifications'
   };
   
@@ -1937,10 +1937,10 @@ app.get('/api/admin/stats', authMiddleware, adminMiddleware, (req, res) => {
   for (const [key, query] of Object.entries(queries)) {
     db.query(query, (err, result) => {
       if (err) {
-        console.error(`Stats error for ${key}:`, err);
+        console.error(`Stats error for ${key}:`, err.message);
         results[key] = 0;
       } else {
-        results[key] = result[0].count;
+        results[key] = result[0]?.count || 0;
       }
       completed++;
       
